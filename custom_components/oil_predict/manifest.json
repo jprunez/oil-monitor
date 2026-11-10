@@ -1,0 +1,15 @@
+{
+  "domain": "oil_predict",
+  "name": "Oil Monitor",
+  "codeowners": [],
+  "config_flow": true,
+  "dependencies": [
+    "panel_custom",
+    "recorder"
+  ],
+  "documentation": "https://github.com/jprunez/oil-monitor",
+  "integration_type": "service",
+  "iot_class": "calculated",
+  "single_config_entry": true,
+  "version": "0.1.0"
+}

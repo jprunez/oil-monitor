@@ -1,0 +1,35 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Oil Monitor",
+        "description": "Choose your tank, temperature, runtime, and weather entities. A personalized forecast needs at least 14 complete, clean weeks of daily long-term statistics.",
+        "data": {
+          "depth_entity": "Tank depth sensor",
+          "timestamp_entity": "Tank reading timestamp sensor",
+          "outdoor_entity": "Outdoor temperature history sensor",
+          "indoor_entity": "Indoor temperature history sensor",
+          "runtime_entity": "Daily heating runtime sensor",
+          "indoor_target_entity": "Indoor target temperature sensor",
+          "weather_entity": "Weather forecast entity",
+          "tank_capacity": "Usable tank capacity (L)",
+          "stale_after_minutes": "Mark the tank reading stale after (minutes)"
+        },
+        "data_description": {
+          "depth_entity": "Select the sensor reporting distance in centimetres from the ultrasonic sensor to the oil surface.",
+          "timestamp_entity": "Select the sensor containing the time the ultrasonic measurement was actually taken, not the MQTT last-updated time.",
+          "outdoor_entity": "Select a temperature sensor with long-term statistics in °C or °F.",
+          "indoor_entity": "Select a room or thermostat temperature sensor with long-term statistics.",
+          "runtime_entity": "Select a sensor that reports daily heating runtime, preferably with long-term statistics.",
+          "indoor_target_entity": "Select the thermostat target temperature. Its current value is used for the forecast.",
+          "weather_entity": "Select a weather entity that provides seven daily forecasts.",
+          "tank_capacity": "The first version uses the supplied depth-to-level calibration table and scales it to this capacity.",
+          "stale_after_minutes": "Your sensor normally reports about every 35 minutes. The default allows for missed reports."
+        }
+      }
+    },
+    "abort": {
+      "already_configured": "Oil Monitor is already configured."
+    }
+  }
+}
