@@ -10,7 +10,7 @@
           "outdoor_entity": "Outdoor temperature history sensor",
           "indoor_entity": "Indoor temperature history sensor",
           "runtime_entity": "Daily heating runtime sensor",
-          "indoor_target_entity": "Indoor target temperature sensor",
+          "indoor_target_entity": "Thermostat or target temperature sensor",
           "weather_entity": "Weather forecast entity",
           "tank_capacity": "Usable tank capacity (L)",
           "stale_after_minutes": "Mark the tank reading stale after (minutes)"
@@ -21,7 +21,7 @@
           "outdoor_entity": "Select a temperature sensor with long-term statistics in °C or °F.",
           "indoor_entity": "Select a room or thermostat temperature sensor with long-term statistics.",
           "runtime_entity": "Select a sensor that reports daily heating runtime, preferably with long-term statistics.",
-          "indoor_target_entity": "Select the thermostat target temperature. Its current value is used for the forecast.",
+          "indoor_target_entity": "Select your thermostat (climate entity) or a sensor holding its target temperature. The current target is used for the forecast.",
           "weather_entity": "Select a weather entity that provides seven daily forecasts.",
           "tank_capacity": "The first version uses the supplied depth-to-level calibration table and scales it to this capacity.",
           "stale_after_minutes": "Your sensor normally reports about every 35 minutes. The default allows for missed reports."

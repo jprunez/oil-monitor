@@ -23,8 +23,13 @@ class OilMonitorPanel extends HTMLElement {
   }
 
   set hass(hass) {
+    const previous = this._hass;
     this._hass = hass;
-    this._render();
+    // Home Assistant pushes a new hass object on every state change anywhere.
+    // Only redraw when one of the entities this panel shows has changed.
+    if (!previous || this._relevantIds().some((id) => previous.states[id] !== hass.states[id])) {
+      this._render();
+    }
     if (!this._loading && Date.now() - this._lastFetch > 15 * 60 * 1000) {
       this._loadStatistics();
     }
@@ -70,6 +75,17 @@ class OilMonitorPanel extends HTMLElement {
       this._loading = false;
       this._render();
     }
+  }
+
+  _relevantIds() {
+    const config = this._panel?.config || {};
+    return [
+      "depth_entity", "timestamp_entity", "outdoor_entity", "indoor_entity",
+      "runtime_entity", "target_entity", "litres_entity", "weekly_entity",
+      "lower_entity", "upper_entity", "stale_entity", "offset_entity",
+    ]
+      .map((key) => config[key])
+      .filter(Boolean);
   }
 
   _state(entityId) {
@@ -118,14 +134,19 @@ class OilMonitorPanel extends HTMLElement {
     if (!this._statistics || ids.some((id) => !id || !this._statistics[id])) return [];
 
     const byDay = new Map();
-    for (const [key, id] of [["depth", depthId], ["outdoor", outdoorId]]) {
+    const dayFormat = new Intl.DateTimeFormat("en-CA", {
+      timeZone: this._hass.config.time_zone,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+    });
+    for (const [key, id] of [
+      ["depth", depthId],
+      ["outdoor", outdoorId],
+      ["indoor", config.indoor_entity],
+    ]) {
       for (const row of this._statistics[id] || []) {
-        const day = new Intl.DateTimeFormat("en-CA", {
-          timeZone: this._hass.config.time_zone,
-          year: "numeric",
-          month: "2-digit",
-          day: "2-digit",
-        }).format(new Date(row.start * 1000));
+        const day = dayFormat.format(new Date(row.start * 1000));
         const point = byDay.get(day) || { day };
         point[key] = row.mean;
         byDay.set(day, point);
@@ -177,10 +198,13 @@ class OilMonitorPanel extends HTMLElement {
           this._litresAtDepth(anchor.depth, capacity) -
           this._litresAtDepth(days.at(-1).depth, capacity);
         if (!refill && oilUsed >= 0 && oilUsed <= 300) {
+          const indoorDays = days.filter((point) => Number.isFinite(point.indoor));
           weekly.push({
             day: dateKey(sunday),
             outdoor: days.reduce((sum, point) => sum + point.outdoor, 0) / 7,
-            indoor: days.reduce((sum, point) => sum + point.indoor, 0) / 7,
+            indoor: indoorDays.length
+              ? indoorDays.reduce((sum, point) => sum + point.indoor, 0) / indoorDays.length
+              : null,
             litres: oilUsed,
           });
         }
@@ -307,9 +331,17 @@ class OilMonitorPanel extends HTMLElement {
     const usingDepthFallback = !Number.isFinite(integrationLitres) && depthEstimate !== null;
     const percent = Number.isFinite(Number(litres)) ? Math.min(100, (Number(litres) / capacity) * 100) : 0;
     const weeks = this._weeklyRows();
-    const dateLabel = new Intl.DateTimeFormat(this._hass.locale?.language, { month: "short", day: "numeric" }).format(new Date());
     const status = stale ? "Tank reading is stale — forecast confidence is reduced." : "Tank reading is current.";
-    const runtimeValue = runtime && runtime.state !== "unknown" && runtime.state !== "unavailable" ? `${this._format(runtime.state, 1)} ${runtime.attributes.unit_of_measurement || "h"}` : "—";
+    const isClimate = target?.entity_id?.startsWith("climate.");
+    const targetValue = isClimate ? target.attributes.temperature : target?.state;
+    const targetUnit = isClimate
+      ? this._hass.config.unit_system?.temperature || "°C"
+      : target?.attributes?.unit_of_measurement || "°C";
+    const offset = Number(this._state(config.offset_entity)?.state);
+    const offsetNote = Number.isFinite(offset) && offset !== 0
+      ? ` · assumes ${offset > 0 ? "+" : ""}${this._format(offset, 1)} °C indoors`
+      : "";
+    const runtimeValue =runtime && runtime.state !== "unknown" && runtime.state !== "unavailable" ? `${this._format(runtime.state, 1)} ${runtime.attributes.unit_of_measurement || "h"}` : "—";
 
     this.shadowRoot.innerHTML = `
       <style>
@@ -320,7 +352,7 @@ class OilMonitorPanel extends HTMLElement {
         <header class="top"><div><div class="eyebrow">Home energy · heating oil</div><h1 class="title">Oil Monitor</h1><p class="subtitle">Your tank, usage trends and weather-aware outlook</p></div><div class="toolbar"><select aria-label="History range"><option value="30" ${this._rangeDays === 30 ? "selected" : ""}>30 days</option><option value="90" ${this._rangeDays === 90 ? "selected" : ""}>90 days</option><option value="365" ${this._rangeDays === 365 ? "selected" : ""}>1 year</option></select><button type="button" class="refresh" title="Refresh history">↻</button></div></header>
         <section class="grid" aria-label="Oil summary">
           <article class="card"><div class="metric-label">${stale ? "Last known oil remaining" : "Oil remaining"}</div><div class="metric">${this._format(litres)} <span class="unit">L</span></div><div class="hint">${usingDepthFallback ? `Calculated from ${this._format(depthCm, 0)} cm depth` : "of " + this._format(capacity) + " L usable capacity"}</div><div class="level"><i style="width:${percent}%"></i></div></article>
-          <article class="card"><div class="metric-label">Estimated use · next 7 days</div><div class="metric">${this._format(weekly)} <span class="unit">L</span></div><div class="hint">Forecast range ${this._format(lower)}–${this._format(upper)} L</div></article>
+          <article class="card"><div class="metric-label">Estimated use · next 7 days</div><div class="metric">${this._format(weekly)} <span class="unit">L</span></div><div class="hint">Forecast range ${this._format(lower)}–${this._format(upper)} L${offsetNote}</div></article>
           <article class="card"><div class="metric-label">Outdoor temperature</div><div class="metric">${this._format(outdoor?.state, 1)} <span class="unit">${outdoor?.attributes?.unit_of_measurement || "°C"}</span></div><div class="hint">Current weather sensor</div></article>
           <article class="card"><div class="metric-label">Tank reading</div><div class="metric ${stale ? "warn" : ""}">${stale ? "Check sensor" : "Current"}</div><div class="hint">Measurement timestamp ${timestamp?.state || "not available"}</div></article>
         </section>
@@ -329,7 +361,7 @@ class OilMonitorPanel extends HTMLElement {
           <article class="chart-card"><h3>Weekly oil use & outdoor temperature</h3><p>Bars and blue line: litres used · orange: mean outdoor temperature</p>${this._chart(weeks)}<div class="legend"><span><i class="key"></i>Oil use (L/week)</span><span><i class="key temp"></i>Outdoor temperature</span></div></article>
           <article class="chart-card"><h3>Oil use vs outdoor temperature</h3><p>Each point is a clean week. Dashed line shows a simple trend, not a guarantee.</p>${this._scatter(weeks)}</article>
         </div></section>
-        <section class="section"><h2>Home heating conditions</h2><p>Live context from your selected Home Assistant entities.</p><div class="details"><div class="detail"><span class="metric-label">Indoor temperature</span><b>${this._format(indoor?.state, 1)} ${indoor?.attributes?.unit_of_measurement || "°C"}</b></div><div class="detail"><span class="metric-label">Thermostat target</span><b>${this._format(target?.state, 1)} ${target?.attributes?.unit_of_measurement || "°C"}</b></div><div class="detail"><span class="metric-label">Heating runtime today</span><b>${runtimeValue}</b></div><div class="detail"><span class="metric-label">History range</span><b>${this._rangeDays} days</b></div></div></section>
+        <section class="section"><h2>Home heating conditions</h2><p>Live context from your selected Home Assistant entities.</p><div class="details"><div class="detail"><span class="metric-label">Indoor temperature</span><b>${this._format(indoor?.state, 1)} ${indoor?.attributes?.unit_of_measurement || "°C"}</b></div><div class="detail"><span class="metric-label">Thermostat target</span><b>${this._format(targetValue, 1)} ${targetUnit}</b></div><div class="detail"><span class="metric-label">Heating runtime today</span><b>${runtimeValue}</b></div><div class="detail"><span class="metric-label">History range</span><b>${this._rangeDays} days</b></div></div></section>
         <p class="foot">Forecasts are estimates learned from available tank, temperature and heating history. A limited or noisy history can make the range wide or misleading. Use this as a planning aid, not as the only basis for ordering oil.</p>
       </main>`;
 

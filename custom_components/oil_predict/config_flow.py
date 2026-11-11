@@ -2,10 +2,7 @@
 
 from typing import Any
 
-try:  # Home Assistant's long-standing schema library.
-    import voluptuous as probatio
-except ImportError:  # pragma: no cover - newer installs
-    import probatio
+import voluptuous as vol
 
 from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
 from homeassistant.helpers import selector
@@ -40,32 +37,32 @@ class OilPredictConfigFlow(ConfigFlow, domain=DOMAIN):
             self._abort_if_unique_id_configured()
             return self.async_create_entry(title="Oil Monitor", data=user_input)
 
-        schema = probatio.Schema(
+        schema = vol.Schema(
             {
-                probatio.Required(CONF_DEPTH_ENTITY): selector.EntitySelector(
+                vol.Required(CONF_DEPTH_ENTITY): selector.EntitySelector(
                     selector.EntitySelectorConfig(domain="sensor")
                 ),
-                probatio.Required(CONF_TIMESTAMP_ENTITY): selector.EntitySelector(
+                vol.Required(CONF_TIMESTAMP_ENTITY): selector.EntitySelector(
                     selector.EntitySelectorConfig(domain="sensor")
                 ),
-                probatio.Required(CONF_OUTDOOR_ENTITY): selector.EntitySelector(
+                vol.Required(CONF_OUTDOOR_ENTITY): selector.EntitySelector(
                     selector.EntitySelectorConfig(domain="sensor")
                 ),
-                probatio.Required(CONF_INDOOR_ENTITY): selector.EntitySelector(
+                vol.Required(CONF_INDOOR_ENTITY): selector.EntitySelector(
                     selector.EntitySelectorConfig(domain="sensor")
                 ),
-                probatio.Required(CONF_RUNTIME_ENTITY): selector.EntitySelector(
+                vol.Required(CONF_RUNTIME_ENTITY): selector.EntitySelector(
                     selector.EntitySelectorConfig(domain="sensor")
                 ),
-                probatio.Required(
+                vol.Required(
                     CONF_INDOOR_TARGET_ENTITY
                 ): selector.EntitySelector(
-                    selector.EntitySelectorConfig(domain="sensor")
+                    selector.EntitySelectorConfig(domain=["climate", "sensor"])
                 ),
-                probatio.Required(CONF_WEATHER_ENTITY): selector.EntitySelector(
+                vol.Required(CONF_WEATHER_ENTITY): selector.EntitySelector(
                     selector.EntitySelectorConfig(domain="weather")
                 ),
-                probatio.Required(
+                vol.Required(
                     CONF_TANK_CAPACITY, default=DEFAULT_TANK_CAPACITY
                 ): selector.NumberSelector(
                     selector.NumberSelectorConfig(
@@ -76,7 +73,7 @@ class OilPredictConfigFlow(ConfigFlow, domain=DOMAIN):
                         mode=selector.NumberSelectorMode.BOX,
                     )
                 ),
-                probatio.Required(
+                vol.Required(
                     CONF_STALE_AFTER_MINUTES,
                     default=DEFAULT_STALE_AFTER_MINUTES,
                 ): selector.NumberSelector(

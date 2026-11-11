@@ -44,6 +44,7 @@ class OilLitresRemainingSensor(
         """Initialize the sensor."""
         super().__init__(coordinator)
         self._attr_unique_id = f"{entry.entry_id}_litres_remaining"
+        self._attr_device_info = coordinator.device_info
 
     @property
     def available(self) -> bool:
@@ -89,6 +90,12 @@ class WeeklyOilUsageSensor(CoordinatorEntity[OilPredictCoordinator], SensorEntit
         }
         self._attr_name = names[estimate]
         self._attr_unique_id = f"{entry.entry_id}_weekly_oil_use_{estimate}"
+        self._attr_device_info = coordinator.device_info
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Expose the indoor-temperature adjustment the estimate was made with."""
+        return {"temperature_offset_c": self.coordinator.data["temperature_offset_c"]}
 
     @property
     def available(self) -> bool:

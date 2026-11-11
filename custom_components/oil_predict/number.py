@@ -36,13 +36,14 @@ class TemperatureAdjustmentNumber(RestoreNumber):
         """Initialize the number."""
         self._coordinator = coordinator
         self._attr_unique_id = f"{entry.entry_id}_temperature_adjustment"
+        self._attr_device_info = coordinator.device_info
         self._attr_native_value = 0.0
 
     async def async_added_to_hass(self) -> None:
         """Restore the last adjustment after a restart."""
         await super().async_added_to_hass()
         last = await self.async_get_last_number_data()
-        if last is not None and last.native_value is not None:
+        if last is not None and last.native_value:
             self._attr_native_value = float(last.native_value)
             self._coordinator.temperature_offset_c = self._attr_native_value
             await self._coordinator.async_request_refresh()

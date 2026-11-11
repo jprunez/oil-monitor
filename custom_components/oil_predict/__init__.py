@@ -6,7 +6,9 @@ from homeassistant.components import frontend
 from homeassistant.components.http import StaticPathConfig
 from homeassistant.components.panel_custom import async_register_panel
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import entity_registry as er
 
 from .const import (
     CONF_DEPTH_ENTITY,
@@ -38,6 +40,22 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Oil Monitor from a config entry."""
+    coordinator = OilPredictCoordinator(hass, entry)
+    await coordinator.async_config_entry_first_refresh()
+    entry.runtime_data = coordinator
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    for unsubscribe in coordinator.async_start_listeners():
+        entry.async_on_unload(unsubscribe)
+
+    # Look up the actual entity IDs, which depend on the device name and on
+    # any renames the user has made, rather than guessing them.
+    registry = er.async_get(hass)
+
+    def entity_id(platform: Platform, key: str) -> str | None:
+        return registry.async_get_entity_id(
+            platform, DOMAIN, f"{entry.entry_id}_{key}"
+        )
+
     if frontend.async_panel_exists(hass, PANEL_PATH):
         frontend.async_remove_panel(hass, PANEL_PATH, warn_if_unknown=False)
     await async_register_panel(
@@ -56,17 +74,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             "target_entity": entry.data[CONF_INDOOR_TARGET_ENTITY],
             "weather_entity": entry.data[CONF_WEATHER_ENTITY],
             "tank_capacity": entry.data[CONF_TANK_CAPACITY],
-            "litres_entity": f"sensor.{DOMAIN}_litres_remaining",
-            "weekly_entity": f"sensor.{DOMAIN}_estimated_oil_use_next_7_days",
-            "lower_entity": f"sensor.{DOMAIN}_oil_use_forecast_lower_estimate",
-            "upper_entity": f"sensor.{DOMAIN}_oil_use_forecast_upper_estimate",
-            "stale_entity": f"binary_sensor.{DOMAIN}_tank_sensor_stale",
+            "litres_entity": entity_id(Platform.SENSOR, "litres_remaining"),
+            "weekly_entity": entity_id(Platform.SENSOR, "weekly_oil_use_total"),
+            "lower_entity": entity_id(Platform.SENSOR, "weekly_oil_use_lower"),
+            "upper_entity": entity_id(Platform.SENSOR, "weekly_oil_use_upper"),
+            "stale_entity": entity_id(Platform.BINARY_SENSOR, "tank_sensor_stale"),
+            "offset_entity": entity_id(Platform.NUMBER, "temperature_adjustment"),
         },
     )
-    coordinator = OilPredictCoordinator(hass, entry)
-    await coordinator.async_config_entry_first_refresh()
-    entry.runtime_data = coordinator
-    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     return True
 
 

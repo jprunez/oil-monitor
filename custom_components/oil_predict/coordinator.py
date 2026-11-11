@@ -1,6 +1,7 @@
 """Read Home Assistant tank entities and prepare integration data."""
 
 from collections import defaultdict
+from collections.abc import Callable
 from datetime import date, datetime, timedelta
 from functools import partial
 import logging
@@ -9,8 +10,13 @@ from typing import Any
 from homeassistant.components.recorder.statistics import statistics_during_period
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import UnitOfTemperature
-from homeassistant.core import HomeAssistant
+from homeassistant.core import Event, EventStateChangedData, HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers.device_registry import DeviceEntryType, DeviceInfo
+from homeassistant.helpers.event import (
+    async_track_state_change_event,
+    async_track_time_interval,
+)
 from homeassistant.helpers.recorder import get_instance
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import dt as dt_util
@@ -31,6 +37,7 @@ from .const import (
 from .model import (
     DailyHistoryPoint,
     DailyTrainingSample,
+    WeeklyForecast,
     build_training_samples,
     depth_to_litres,
     fit_usage_model,
@@ -40,9 +47,17 @@ from .model import (
 
 _LOGGER = logging.getLogger(__name__)
 
+# How often the stale flag is re-evaluated when no new reading arrives.
+STALE_CHECK_INTERVAL = timedelta(minutes=5)
+
 
 class OilPredictCoordinator(DataUpdateCoordinator[dict[str, Any]]):
-    """Coordinate tank data and expose validated values to entities."""
+    """Coordinate tank data and expose validated values to entities.
+
+    The weather-based forecast is recalculated on the coordinator's interval
+    (or on request). Live tank values are recalculated whenever the depth or
+    timestamp sensor changes, and the stale flag is re-checked periodically.
+    """
 
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
         """Initialize the coordinator."""
@@ -54,11 +69,103 @@ class OilPredictCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             update_interval=timedelta(hours=3),
         )
         self.entry = entry
+        self.temperature_offset_c = 0.0
         self._history_loaded_at: datetime | None = None
         self._training_samples: list[DailyTrainingSample] = []
+        self._weekly_forecast: WeeklyForecast | None = None
+        self._forecast_warning: str | None = None
+
+    @property
+    def device_info(self) -> DeviceInfo:
+        """Group all Oil Monitor entities under one service device."""
+        return DeviceInfo(
+            identifiers={(DOMAIN, self.entry.entry_id)},
+            name="Oil Monitor",
+            entry_type=DeviceEntryType.SERVICE,
+        )
+
+    @callback
+    def async_start_listeners(self) -> list[Callable[[], None]]:
+        """Track source sensors so live values do not wait for the next poll."""
+        live_entities = [
+            self.entry.data[CONF_DEPTH_ENTITY],
+            self.entry.data[CONF_TIMESTAMP_ENTITY],
+        ]
+        return [
+            async_track_state_change_event(
+                self.hass, live_entities, self._async_handle_live_change
+            ),
+            async_track_state_change_event(
+                self.hass,
+                [self.entry.data[CONF_INDOOR_TARGET_ENTITY]],
+                self._async_handle_target_change,
+            ),
+            async_track_time_interval(
+                self.hass, self._async_handle_stale_check, STALE_CHECK_INTERVAL
+            ),
+        ]
+
+    @callback
+    def _async_push_live_data(self) -> None:
+        """Rebuild live values and notify entities without resetting the poll timer."""
+        if self.data is None:
+            return
+        self.data = self._build_data()
+        self.async_update_listeners()
+
+    @callback
+    def _async_handle_live_change(self, _event: Event[EventStateChangedData]) -> None:
+        self._async_push_live_data()
+
+    @callback
+    def _async_handle_stale_check(self, _now: datetime) -> None:
+        self._async_push_live_data()
+
+    async def _async_handle_target_change(
+        self, _event: Event[EventStateChangedData]
+    ) -> None:
+        await self.async_request_refresh()
 
     async def _async_update_data(self) -> dict[str, Any]:
-        """Read current states, using the sensor's measurement timestamp."""
+        """Recalculate the forecast, then combine it with live tank values."""
+        await self._async_update_forecast()
+        return self._build_data()
+
+    async def _async_update_forecast(self) -> None:
+        """Refresh training history when due and recalculate the weekly forecast."""
+        temperature_target = self._read_temperature_c(
+            self.entry.data[CONF_INDOOR_TARGET_ENTITY]
+        )
+        try:
+            if (
+                self._history_loaded_at is None
+                or dt_util.utcnow() - self._history_loaded_at > timedelta(hours=24)
+            ):
+                self._training_samples = await self._async_load_training_history()
+                self._history_loaded_at = dt_util.utcnow()
+
+            if len(self._training_samples) >= 14 and temperature_target is not None:
+                model = fit_usage_model(self._training_samples)
+                forecast_temperatures = await self._async_get_daily_forecast_c()
+                self._weekly_forecast = forecast_week(
+                    model,
+                    forecast_temperatures,
+                    temperature_target + self.temperature_offset_c,
+                )
+                self._forecast_warning = None
+            else:
+                self._weekly_forecast = None
+                self._forecast_warning = (
+                    "Need at least 14 complete, clean weeks of history and a valid "
+                    "indoor target temperature"
+                )
+        except (HomeAssistantError, ValueError, TypeError, KeyError) as err:
+            _LOGGER.warning("Could not calculate the oil forecast: %s", err)
+            self._weekly_forecast = None
+            self._forecast_warning = str(err)
+
+    def _build_data(self) -> dict[str, Any]:
+        """Read current tank states, using the sensor's measurement timestamp."""
         depth_state = self.hass.states.get(self.entry.data[CONF_DEPTH_ENTITY])
         timestamp_state = self.hass.states.get(self.entry.data[CONF_TIMESTAMP_ENTITY])
 
@@ -91,56 +198,37 @@ class OilPredictCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             except ValueError:
                 _LOGGER.debug("Ignoring invalid tank depth: %s", depth_cm)
 
-        temperature_target = self._read_temperature_c(
-            self.entry.data[CONF_INDOOR_TARGET_ENTITY]
-        )
-        history_warning = None
-        try:
-            if (
-                self._history_loaded_at is None
-                or dt_util.utcnow() - self._history_loaded_at > timedelta(hours=24)
-            ):
-                self._training_samples = await self._async_load_training_history()
-                self._history_loaded_at = dt_util.utcnow()
-
-            if len(self._training_samples) >= 14 and temperature_target is not None:
-                model = fit_usage_model(self._training_samples)
-                forecast_temperatures = await self._async_get_daily_forecast_c()
-                weekly_forecast = forecast_week(
-                    model, forecast_temperatures, temperature_target
-                )
-            else:
-                weekly_forecast = None
-                history_warning = (
-                    "Need at least 14 complete, clean weeks of history and a valid "
-                    "indoor target temperature"
-                )
-        except (HomeAssistantError, ValueError, TypeError, KeyError) as err:
-            _LOGGER.warning("Could not calculate the oil forecast: %s", err)
-            weekly_forecast = None
-            history_warning = str(err)
-
         return {
             "depth_cm": depth_cm,
             "litres_remaining": litres_remaining,
             "sample_time": sample_time.isoformat() if sample_time else None,
             "age_minutes": age_minutes,
             "is_stale": not is_fresh or litres_remaining is None,
-            "weekly_forecast": weekly_forecast,
+            "weekly_forecast": self._weekly_forecast,
             "training_weeks": len(self._training_samples),
-            "forecast_warning": history_warning,
+            "forecast_warning": self._forecast_warning,
+            "temperature_offset_c": self.temperature_offset_c,
         }
 
     def _read_temperature_c(self, entity_id: str) -> float | None:
-        """Read an entity state and convert its temperature to Celsius."""
+        """Read a temperature in Celsius from a sensor or a climate entity's target."""
         state = self.hass.states.get(entity_id)
-        if state is None or state.state in ("unknown", "unavailable"):
+        if state is None:
             return None
+        if state.domain == "climate":
+            raw = state.attributes.get("temperature")
+            unit = self.hass.config.units.temperature_unit
+        else:
+            if state.state in ("unknown", "unavailable"):
+                return None
+            raw = state.state
+            unit = state.attributes.get(
+                "unit_of_measurement", UnitOfTemperature.CELSIUS
+            )
         try:
-            value = float(state.state)
+            value = float(raw)
         except (TypeError, ValueError):
             return None
-        unit = state.attributes.get("unit_of_measurement", UnitOfTemperature.CELSIUS)
         if unit == UnitOfTemperature.FAHRENHEIT:
             return TemperatureConverter.convert(
                 value, UnitOfTemperature.FAHRENHEIT, UnitOfTemperature.CELSIUS

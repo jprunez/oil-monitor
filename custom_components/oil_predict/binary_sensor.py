@@ -39,6 +39,7 @@ class OilTankSensorStaleBinarySensor(
         """Initialize the binary sensor."""
         super().__init__(coordinator)
         self._attr_unique_id = f"{entry.entry_id}_tank_sensor_stale"
+        self._attr_device_info = coordinator.device_info
 
     @property
     def is_on(self) -> bool:
