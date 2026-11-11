@@ -100,6 +100,43 @@ class OilMonitorPanel extends HTMLElement {
     return match?.entity_id;
   }
 
+  // Parse the tank sensor's timestamp: ISO text, or Unix seconds/milliseconds.
+  _parseSampleTime(value) {
+    if (value === null || value === undefined || value === "") return null;
+    const numeric = Number(value);
+    let date;
+    if (Number.isFinite(numeric) && numeric > 0) {
+      date = new Date(numeric > 100_000_000_000 ? numeric : numeric * 1000);
+    } else {
+      date = new Date(String(value));
+    }
+    return Number.isNaN(date.getTime()) ? null : date;
+  }
+
+  // e.g. "Measured 12 min ago · 07:58", "Measured yesterday at 22:10".
+  _friendlySampleTime(value) {
+    const date = this._parseSampleTime(value);
+    if (!date) return "No measurement time available";
+    const language = this._hass?.locale?.language;
+    const timeZone = this._hass?.config?.time_zone;
+    const time = new Intl.DateTimeFormat(language, { hour: "2-digit", minute: "2-digit", timeZone }).format(date);
+    const dayKey = (d) => new Intl.DateTimeFormat("en-CA", { timeZone }).format(d);
+    const minutes = Math.round((Date.now() - date.getTime()) / 60000);
+    if (minutes < 0) return `Measured at ${time}`;
+    if (minutes < 1) return `Measured just now · ${time}`;
+    if (minutes < 60) return `Measured ${minutes} min ago · ${time}`;
+    if (dayKey(date) === dayKey(new Date())) {
+      const hours = Math.floor(minutes / 60);
+      const rest = minutes % 60;
+      return `Measured ${hours} h${rest ? ` ${rest} min` : ""} ago · ${time}`;
+    }
+    if (dayKey(date) === dayKey(new Date(Date.now() - 86400000))) {
+      return `Measured yesterday at ${time}`;
+    }
+    const day = new Intl.DateTimeFormat(language, { weekday: "short", day: "numeric", month: "short", timeZone }).format(date);
+    return `Measured ${day} at ${time}`;
+  }
+
   _format(value, digits = 0) {
     if (value === null || value === undefined || !Number.isFinite(Number(value))) {
       return "—";
@@ -434,7 +471,7 @@ class OilMonitorPanel extends HTMLElement {
           <article class="card"><div class="metric-label">${stale ? "Last known oil remaining" : "Oil remaining"}</div><div class="metric">${this._format(litres)} <span class="unit">L</span></div><div class="hint">${usingDepthFallback ? `Calculated from ${this._format(depthCm, 0)} cm depth` : "of " + this._format(capacity) + " L usable capacity"}</div><div class="level"><i style="width:${percent}%"></i></div></article>
           <article class="card"><div class="metric-label">Estimated use · next 7 days</div><div class="metric">${this._format(weekly)} <span class="unit">L</span></div><div class="hint">${estimateHint}${hasEstimate ? offsetNote : ""}</div></article>
           <article class="card"><div class="metric-label">Outdoor temperature</div><div class="metric">${this._format(outdoor?.state, 1)} <span class="unit">${outdoor?.attributes?.unit_of_measurement || "°C"}</span></div><div class="hint">Current weather sensor</div></article>
-          <article class="card"><div class="metric-label">Tank reading</div><div class="metric ${stale ? "warn" : ""}">${stale ? "Check sensor" : "Current"}</div><div class="hint">Measurement timestamp ${timestamp?.state || "not available"}</div></article>
+          <article class="card"><div class="metric-label">Tank reading</div><div class="metric ${stale ? "warn" : ""}">${stale ? "Check sensor" : "Current"}</div><div class="hint" title="${this._escape(timestamp?.state || "")}">${this._escape(this._friendlySampleTime(timestamp?.state))}</div></article>
         </section>
         <div class="status ${stale ? "warn" : ""}">${status}${this._loading ? " Loading recorder history…" : ""}${this._error ? ` History: ${this._escape(this._error)}` : ""}</div>
         <section class="section"><h2>Usage and weather over time</h2><p>Weekly tank-level changes are converted with your tank calibration and compared with weekly outdoor temperatures. Refill and suspect weeks are excluded.</p><div class="charts">
