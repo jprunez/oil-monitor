@@ -418,4 +418,27 @@ async def test_winter_scenarios(
     assert empty.attributes["earliest_date"] <= empty.attributes["date"] <= empty.attributes["latest_date"]
     point = empty.attributes["projection"][-1]
     assert point["cold"] <= point["litres"] <= point["mild"]
-    assert set(point) == {"date", "litres", "mild", "cold"}
+    assert set(point) == {"date", "litres", "mild", "cold", "last_year"}
+    # The test history is only four months long, so there is nothing from a year ago.
+    assert point["last_year"] is None
+
+    # Last year's usage, replayed from today's level: 5 L/day, with a
+    # 400 L delivery on day 30 that must not count as negative use.
+    from custom_components.oil_predict.model import same_day_in_year
+
+    coordinator = entry.runtime_data
+    today = dt_util.now().date()
+    history = {}
+    litres = 900.0
+    for offset in range(0, 100):
+        if offset == 30:
+            litres += 400
+        history[same_day_in_year(today + timedelta(days=offset), 1)] = litres
+        litres -= 5
+    coordinator._litres_history = history
+    points = coordinator._level_projection(500.0)
+    by_offset = {index * 3: p["last_year"] for index, p in enumerate(points)}
+    assert by_offset[0] == 500.0
+    assert by_offset[27] == pytest.approx(500 - 5 * 27)
+    assert by_offset[60] == pytest.approx(500 - 5 * 59)  # delivery day skipped
+    assert by_offset[120] is None  # history ran out: the line stops

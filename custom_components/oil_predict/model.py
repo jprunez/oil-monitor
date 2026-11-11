@@ -700,7 +700,7 @@ SCENARIO_RANK_DAYS = 182
 FALLBACK_SCENARIO_SHIFT_C = 2.0
 
 
-def _same_day_in_year(day: date, years_back: int) -> date:
+def same_day_in_year(day: date, years_back: int) -> date:
     """The same calendar day ``years_back`` years earlier (29 Feb -> 28 Feb)."""
     try:
         return day.replace(year=day.year - years_back)
@@ -738,12 +738,12 @@ def historical_year_temperatures(
     oldest = min(archive)
     years: list[list[float]] = []
     back = 1
-    while _same_day_in_year(start, back) >= oldest:
+    while same_day_in_year(start, back) >= oldest:
         temps: list[float] = []
         missing = 0
         last: float | None = None
         for offset in range(days):
-            value = archive.get(_same_day_in_year(start + timedelta(days=offset), back))
+            value = archive.get(same_day_in_year(start + timedelta(days=offset), back))
             if value is None:
                 missing += 1
                 value = last

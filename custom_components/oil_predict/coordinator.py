@@ -48,6 +48,7 @@ from .climate_history import ClimateHistoryManager
 from .model import (
     DEPTH_TO_PERCENT,
     FALLBACK_SCENARIO_SHIFT_C,
+    REFILL_RISE_FRACTION,
     LEVEL_DISTANCE,
     LEVEL_LITRES,
     LEVEL_PERCENT,
@@ -67,6 +68,7 @@ from .model import (
     parse_calibration,
     pick_scenarios,
     reading_to_litres,
+    same_day_in_year,
     forecast_week,
     parse_sample_timestamp,
     predict_day,
@@ -143,6 +145,7 @@ class OilPredictCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._outdoor_history: dict[date, float] = {}
         # Projected daily litres for a typical, mild and cold winter.
         self._usage: dict[str, list[float]] | None = None
+        self._litres_history: dict[date, float] = {}
         self.scenario_info: dict[str, Any] | None = None
         self.climate: ClimateHistoryManager | None = (
             ClimateHistoryManager(hass, entry.data.get(CONF_HISTORY_LOCATION))
@@ -541,6 +544,10 @@ class OilPredictCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         today = dt_util.now().date()
         points: list[dict[str, Any]] = []
         level = {name: litres for name in self._usage}
+        # What the tank would do from today's level if oil were used exactly
+        # as it was over the same dates last year (deliveries ignored).
+        last_year: float | None = litres
+        refill_rise = REFILL_RISE_FRACTION * self.tank.capacity_litres
         for offset in range(PROJECTION_CHART_DAYS + 1):
             if offset % PROJECTION_CHART_STEP == 0:
                 points.append(
@@ -549,10 +556,21 @@ class OilPredictCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         "litres": round(max(0.0, level["typical"]), 1),
                         "mild": round(max(0.0, level["mild"]), 1),
                         "cold": round(max(0.0, level["cold"]), 1),
+                        "last_year": (
+                            None if last_year is None else round(max(0.0, last_year), 1)
+                        ),
                     }
                 )
             for name, usage in self._usage.items():
                 level[name] -= usage[offset]
+            if last_year is not None:
+                day = same_day_in_year(today + timedelta(days=offset), 1)
+                before = self._litres_history.get(day)
+                after = self._litres_history.get(day + timedelta(days=1))
+                if before is None or after is None:
+                    last_year = None  # no reading a year ago: stop the line
+                elif after - before <= refill_rise:
+                    last_year -= before - after
         return points
 
     def _run_out(self, litres: float | None, level: float) -> dict[str, Any]:
@@ -778,6 +796,23 @@ class OilPredictCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             outdoor_history[day] = outdoor
         self._outdoor_history = outdoor_history
         air_temps = self._update_temp_correction(daily, outdoor_history)
+
+        # Daily litres for every day with a tank reading, for the dashboard's
+        # "last year" comparison.
+        litres_history: dict[date, float] = {}
+        for day, values in daily.items():
+            if "level" not in values:
+                continue
+            level = values["level"]
+            if self.temp_correction["active"] and day in air_temps:
+                level = temperature_corrected_distance(
+                    level, air_temps[day], self.temp_correction["reference_c"]
+                )
+            try:
+                litres_history[day] = reading_to_litres(level, self.tank)
+            except ValueError:
+                continue
+        self._litres_history = litres_history
         for day, values in sorted(daily.items()):
             if not all(key in values for key in required):
                 continue
