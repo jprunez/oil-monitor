@@ -62,5 +62,6 @@ class OilTankSensorStaleBinarySensor(
             "temp_correction": data["temp_correction"],
             "scenario_info": data["scenario_info"],
             "backtest": data["backtest"],
+            "weather_terms": data["weather_terms"],
             "forecast_warning": data["forecast_warning"],
         }

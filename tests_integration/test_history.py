@@ -49,6 +49,7 @@ async def _record_history(
     runtime_as_total: bool,
     indoor: bool = True,
     weather_driven: bool = False,
+    wind_on=None,
 ) -> None:
     """Record ~4 months of hourly statistics: steady use, cold weather."""
     hours = _hours()
@@ -66,7 +67,11 @@ async def _record_history(
 
     def hours_at(d: float) -> float:
         # Heating hours per day: fixed, or more in colder weeks.
-        return 0.4 * (19.5 - outdoor_at(d)) if weather_driven else 4.0
+        hours = 0.4 * (19.5 - outdoor_at(d)) if weather_driven else 4.0
+        if wind_on is not None:
+            # Windy days need noticeably more heating.
+            hours *= 1 + 0.04 * (wind_on((first + timedelta(days=d)).date()) - 15)
+        return hours
 
     # Distance to the oil grows about 0.1 cm per heating hour as oil is used.
     depth_rows = []
@@ -357,7 +362,11 @@ async def test_winter_scenarios(
             archive[day] = 6.0 + ((day.year * 7) % 9 - 4)
             day += timedelta(days=1)
         no_weather_history_download.side_effect = None
-        no_weather_history_download.return_value = archive
+        no_weather_history_download.return_value = {
+            "temperature": archive,
+            "wind": {day: 12.0 + (day.toordinal() * 7) % 11 for day in archive},
+            "sun": {day: 2.0 + (day.toordinal() * 3) % 7 for day in archive},
+        }
 
     await _record_history(hass, runtime_as_total=False, weather_driven=True)
     _register_weather(hass)
@@ -399,6 +408,10 @@ async def test_winter_scenarios(
 
     stale = state("binary_sensor", "tank_sensor_stale")
     assert stale.attributes["forecast_warning"] is None, stale.attributes
+    # Wind made no difference in this history, so it must not be switched on.
+    assert stale.attributes["weather_terms"]["status"] == (
+        "off_no_gain" if download_works else "off_no_data"
+    )
     info = stale.attributes["scenario_info"]
     rows = {row["role"]: row for row in stale.attributes["setup_check"]}
     if download_works:
@@ -450,3 +463,70 @@ async def test_winter_scenarios(
     assert by_offset[27] == pytest.approx(500 - 5 * 27)
     assert by_offset[60] == pytest.approx(500 - 5 * 59)  # delivery day skipped
     assert by_offset[120] is None  # history ran out: the line stops
+
+
+
+def _weekly_wind(day) -> float:
+    """A wind speed that changes week to week (8 to 23 km/h)."""
+    return 8.0 + 3 * ((day.isocalendar()[1] * 5) % 6)
+
+
+async def test_wind_is_used_when_it_explains_past_use(
+    hass: HomeAssistant, hass_storage, no_weather_history_download
+) -> None:
+    """When windy weeks really used more oil, wind is switched on and improves the score."""
+    from datetime import date
+
+    today = dt_util.now().date()
+    archive, wind, sun = {}, {}, {}
+    day = date(today.year - 20, 1, 1)
+    while day < today - timedelta(days=7):
+        archive[day] = 6.0 + ((day.year * 7) % 9 - 4)
+        wind[day] = _weekly_wind(day)
+        sun[day] = 4.0
+        day += timedelta(days=1)
+    no_weather_history_download.side_effect = None
+    no_weather_history_download.return_value = {"temperature": archive, "wind": wind, "sun": sun}
+
+    await _record_history(
+        hass, runtime_as_total=False, weather_driven=True, wind_on=_weekly_wind
+    )
+    _register_weather(hass)
+    hass.states.async_set("sensor.tank_depth", "60", {"unit_of_measurement": "cm", "state_class": "measurement"})
+    hass.states.async_set("sensor.outdoor", "6", {"unit_of_measurement": "°C", "state_class": "measurement"})
+    hass.states.async_set("sensor.indoor", "19.5", {"unit_of_measurement": "°C", "state_class": "measurement"})
+    hass.states.async_set("climate.home", "heat", {"temperature": 19})
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        version=2,
+        unique_id=DOMAIN,
+        data={
+            "depth_entity": "sensor.tank_depth",
+            "level_type": "distance",
+            "tank_capacity": 1000,
+            "tank_shape": "vertical",
+            "full_distance_cm": 10,
+            "empty_distance_cm": 130,
+            "outdoor_entity": "sensor.outdoor",
+            "indoor_entity": "sensor.indoor",
+            "indoor_target_entity": "climate.home",
+            "weather_entity": "weather.home",
+            "stale_after_minutes": 90,
+        },
+    )
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    stale = hass.states.get(
+        er.async_get(hass).async_get_entity_id(
+            "binary_sensor", DOMAIN, f"{entry.entry_id}_tank_sensor_stale"
+        )
+    )
+    terms = stale.attributes["weather_terms"]
+    assert terms["status"] == "on", terms
+    assert terms["gain_percent"] > 20
+    assert terms["wind_litres_per_degree_kmh"] > 0
+    rows = {row["role"]: row for row in stale.attributes["setup_check"]}
+    assert rows["wind_sun"]["message"].startswith("On.")
+    assert stale.attributes["forecast_warning"] is None

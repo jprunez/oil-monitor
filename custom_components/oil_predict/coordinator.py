@@ -2,7 +2,7 @@
 
 from collections import defaultdict
 from collections.abc import Callable, Mapping
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import date, datetime, timedelta
 from functools import partial
 import logging
@@ -54,12 +54,14 @@ from .model import (
     LEVEL_LITRES,
     LEVEL_PERCENT,
     MIN_TRAINING_WEEKS,
+    MIN_WEATHER_WEEKS,
     SHAPE_CUSTOM,
     DailyHistoryPoint,
     DailyTrainingSample,
     BacktestResult,
     TankConfig,
     UsageModel,
+    WeatherTerms,
     WeeklyForecast,
     backtest_weekly,
     build_training_samples,
@@ -67,7 +69,8 @@ from .model import (
     days_until_level,
     estimate_temperature_drift,
     fit_usage_model,
-    historical_year_temperatures,
+    fit_weather_terms,
+    historical_years,
     parse_calibration,
     pick_scenarios,
     reading_to_litres,
@@ -77,6 +80,7 @@ from .model import (
     predict_day,
     seasonal_outdoor_c,
     temperature_corrected_distance,
+    weather_terms_help,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -142,6 +146,9 @@ class OilPredictCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._weather_error: str | None = None
         self.model: UsageModel | None = None
         self.backtest: BacktestResult | None = None
+        # Wind and sun are used only if they improved past forecasts.
+        self.weather_terms: WeatherTerms | None = None
+        self.weather_terms_info: dict[str, Any] = {"status": "off_no_data"}
         self._history_entities: dict[str, str] = {}
         self.tank = tank_from_config(entry.data)
         self.reorder_level_litres = round(self.tank.capacity_litres * REORDER_FRACTION)
@@ -242,6 +249,7 @@ class OilPredictCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self.backtest = await self.hass.async_add_executor_job(
                     backtest_weekly, self._training_samples
                 )
+                await self._async_evaluate_weather_terms()
 
             if len(self._training_samples) < MIN_TRAINING_WEEKS:
                 self._weekly_forecast = None
@@ -267,11 +275,29 @@ class OilPredictCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 raise
             self._weather_error = None
             indoor_target = temperature_target + self.temperature_offset_c
+            self.weather_terms = None
+            week_adjust: list[float] | None = None
+            if self.weather_terms_info["status"] == "on" and self.climate is not None:
+                self.weather_terms = fit_weather_terms(model, self._training_samples)
+            if self.weather_terms is not None:
+                recent = await self.climate.async_get_recent()
+                today = dt_util.now().date()
+                week_adjust = [
+                    self.weather_terms.adjustment(
+                        model,
+                        temp,
+                        indoor_target,
+                        recent["wind"].get(today + timedelta(days=index)),
+                        recent["sun"].get(today + timedelta(days=index)),
+                    )
+                    for index, temp in enumerate(forecast_temperatures)
+                ]
             self._weekly_forecast = forecast_week(
                 model,
                 forecast_temperatures,
                 indoor_target,
                 self.backtest.rmse_litres if self.backtest else None,
+                week_adjust,
             )
             await self._async_build_scenarios(
                 model, forecast_temperatures, indoor_target
@@ -448,6 +474,33 @@ class OilPredictCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     "history_days": None,
                 }
             )
+        weather = self.weather_terms_info
+        if self.backtest is not None or weather["status"] == "disabled":
+            messages = {
+                "on": (
+                    f"On. Including wind and sun made past weekly forecasts "
+                    f"{weather.get('gain_percent', 0):.0f} % more accurate "
+                    f"(tested on {weather.get('weeks', 0)} weeks)."
+                ),
+                "off_no_gain": (
+                    "Off. Tested on your history: wind and sun didn't make past "
+                    "forecasts more accurate, so they are left out."
+                ),
+                "off_no_data": (
+                    f"Off. Needs weather history and at least {MIN_WEATHER_WEEKS} clean weeks."
+                ),
+                "disabled": "Off. Weather history is switched off.",
+            }
+            rows.append(
+                {
+                    "role": "wind_sun",
+                    "label": "Wind and sun",
+                    "entity_id": "",
+                    "status": "ok",
+                    "message": messages[weather["status"]],
+                    "history_days": None,
+                }
+            )
         if self.tank.level_type == LEVEL_DISTANCE:
             correction = self.temp_correction
             if correction["active"]:
@@ -491,19 +544,41 @@ class OilPredictCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         use. Without it, last year's temperatures are shifted up and down.
         """
         today = dt_util.now().date()
-        week = [predict_day(model, temp, indoor_target_c)[1] for temp in forecast_temperatures]
+        week = [day.predicted_litres for day in self._weekly_forecast.days]
+        terms = self.weather_terms
         rest_start = today + timedelta(days=len(week))
         rest_days = PROJECTION_DAYS - len(week)
 
         history = await self.climate.async_get() if self.climate is not None else None
         if history is not None:
             offset = climate_offset(self._outdoor_history, history.daily)
-            years = historical_year_temperatures(history.daily, rest_start, rest_days)
+            years = historical_years(history.daily, rest_start, rest_days)
+            wind_years = historical_years(history.wind, rest_start, rest_days) if terms else {}
+            sun_years = historical_years(history.sun, rest_start, rest_days) if terms else {}
+
+            def year_usage(back: int, temps: list[float]) -> list[float]:
+                wind = wind_years.get(back)
+                sun = sun_years.get(back)
+                usage: list[float] = []
+                for index, temp in enumerate(temps):
+                    litres = predict_day(model, temp + offset, indoor_target_c)[1]
+                    if terms is not None:
+                        litres = max(
+                            0.0,
+                            litres
+                            + terms.adjustment(
+                                model,
+                                temp + offset,
+                                indoor_target_c,
+                                wind[index] if wind else None,
+                                sun[index] if sun else None,
+                            ),
+                        )
+                    usage.append(litres)
+                return usage
+
             picked = pick_scenarios(
-                [
-                    [predict_day(model, temp + offset, indoor_target_c)[1] for temp in year]
-                    for year in years
-                ]
+                [year_usage(back, temps) for back, temps in years.items()]
             )
             if picked is not None:
                 typical, mild, cold = picked
@@ -548,6 +623,56 @@ class OilPredictCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "weather_history_enabled": self.climate is not None,
             "error": self.climate.error if self.climate is not None else None,
         }
+
+    async def _async_evaluate_weather_terms(self) -> None:
+        """Attach wind and sun to past weeks and test whether they help.
+
+        Wind and sun are switched on only when a model using them would have
+        predicted past weeks measurably better than one without.
+        """
+        self.weather_terms_info = {"status": "disabled" if self.climate is None else "off_no_data"}
+        if self.climate is None:
+            return
+        history = await self.climate.async_get()
+        if history is None or not history.wind or not history.sun:
+            return
+        recent = await self.climate.async_get_recent()
+        wind = {**history.wind, **recent.get("wind", {})}
+        sun = {**history.sun, **recent.get("sun", {})}
+
+        samples: list[DailyTrainingSample] = []
+        with_weather = 0
+        for sample in self._training_samples:
+            days = (
+                [sample.week_start + timedelta(days=offset) for offset in range(7)]
+                if sample.week_start is not None
+                else []
+            )
+            if days and all(day in wind and day in sun for day in days):
+                sample = replace(
+                    sample,
+                    wind_kmh=sum(wind[day] for day in days) / 7,
+                    sun_mj=sum(sun[day] for day in days) / 7,
+                )
+                with_weather += 1
+            samples.append(sample)
+        self._training_samples = samples
+        if self.backtest is None or with_weather < MIN_WEATHER_WEEKS:
+            return
+
+        scored = await self.hass.async_add_executor_job(backtest_weekly, samples, True)
+        gain = (
+            1 - scored.rmse_litres / self.backtest.rmse_litres
+            if scored is not None and self.backtest.rmse_litres > 0
+            else 0.0
+        )
+        self.weather_terms_info = {
+            "status": "on" if weather_terms_help(self.backtest, scored) else "off_no_gain",
+            "weeks": with_weather,
+            "gain_percent": round(gain * 100, 1),
+        }
+        if self.weather_terms_info["status"] == "on":
+            self.backtest = scored
 
     def _level_projection(self, litres: float | None) -> list[dict[str, Any]] | None:
         """Projected litres every few days for about six months, for charting."""
@@ -694,6 +819,10 @@ class OilPredictCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "temp_correction": dict(self.temp_correction),
             "scenario_info": dict(self.scenario_info) if self.scenario_info else None,
             "backtest": asdict(self.backtest) if self.backtest else None,
+            "weather_terms": {
+                **self.weather_terms_info,
+                **(asdict(self.weather_terms) if self.weather_terms else {}),
+            },
             "setup_check": self.setup_check(),
             "forecast_warning": self._forecast_warning,
             "temperature_offset_c": self.temperature_offset_c,

@@ -45,12 +45,16 @@ def no_weather_history_download():
 
     with (
         patch(
-            "custom_components.oil_predict.climate_history.async_fetch_daily_temperatures",
+            "custom_components.oil_predict.climate_history.async_fetch_daily_weather",
             AsyncMock(side_effect=ClimateHistoryError("Could not download weather history: offline")),
         ) as fetch,
         patch(
             "custom_components.oil_predict.climate_history.async_geocode",
             AsyncMock(return_value=(54.0, -1.1, "YO10 area")),
+        ),
+        patch(
+            "custom_components.oil_predict.climate_history.async_fetch_recent_and_forecast",
+            AsyncMock(return_value={"temperature": {}, "wind": {}, "sun": {}}),
         ),
     ):
         yield fetch

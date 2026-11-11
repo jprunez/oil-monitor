@@ -190,6 +190,9 @@ class DailyTrainingSample:
     indoor_mean_c: float
     heating_hours: float | None
     litres_used: float
+    week_start: date | None = None
+    wind_kmh: float | None = None  # mean wind speed that week
+    sun_mj: float | None = None  # mean daily solar radiation that week
 
 
 @dataclass(frozen=True)
@@ -278,6 +281,7 @@ def build_training_samples(
                     sum(runtimes) / 7 if has_runtime else None  # type: ignore[arg-type]
                 ),
                 litres_used=weekly_usage / 7,
+                week_start=days[0],
             )
         )
 
@@ -493,6 +497,7 @@ def forecast_week(
     forecast_outdoor_mean_c: Sequence[float],
     indoor_target_c: float,
     weekly_error_rmse: float | None = None,
+    daily_adjust_litres: Sequence[float] | None = None,
 ) -> WeeklyForecast:
     """Estimate oil consumption day by day from the coming week's weather."""
     if len(forecast_outdoor_mean_c) != 7:
@@ -503,8 +508,11 @@ def forecast_week(
         raise ValueError("Outdoor forecast temperatures must be finite")
 
     days: list[ForecastDay] = []
-    for outdoor_mean in forecast_outdoor_mean_c:
+    for index, outdoor_mean in enumerate(forecast_outdoor_mean_c):
         heating_hours, litres = predict_day(model, outdoor_mean, indoor_target_c)
+        if daily_adjust_litres is not None:
+            # Wind and sun adjustment for that day (see ``WeatherTerms``).
+            litres = max(0.0, litres + daily_adjust_litres[index])
         days.append(
             ForecastDay(
                 outdoor_mean_c=outdoor_mean,
@@ -738,10 +746,20 @@ def historical_year_temperatures(
     Returns one list per past year that has (nearly) complete data; short
     gaps are filled with the previous day's value.
     """
+    return list(historical_years(archive, start, days, max_missing_fraction).values())
+
+
+def historical_years(
+    archive: Mapping[date, float],
+    start: date,
+    days: int,
+    max_missing_fraction: float = 0.05,
+) -> dict[int, list[float]]:
+    """Like ``historical_year_temperatures`` but keyed by how many years back."""
     if not archive:
-        return []
+        return {}
     oldest = min(archive)
-    years: list[list[float]] = []
+    years: dict[int, list[float]] = {}
     back = 1
     while same_day_in_year(start, back) >= oldest:
         temps: list[float] = []
@@ -757,7 +775,7 @@ def historical_year_temperatures(
             temps.append(value)
             last = value
         if len(temps) == days and missing <= days * max_missing_fraction:
-            years.append(temps)
+            years[back] = temps
         back += 1
     return years
 
@@ -794,7 +812,9 @@ class BacktestResult:
     mean_weekly_use_litres: float
 
 
-def backtest_weekly(samples: Sequence[DailyTrainingSample]) -> BacktestResult | None:
+def backtest_weekly(
+    samples: Sequence[DailyTrainingSample], use_weather: bool = False
+) -> BacktestResult | None:
     """Score the model on every past week using a model that never saw it.
 
     Each week in turn is left out, the model is fitted to the remaining
@@ -812,6 +832,20 @@ def backtest_weekly(samples: Sequence[DailyTrainingSample]) -> BacktestResult | 
         except ValueError:
             return None
         _, predicted = predict_day(model, held_out.outdoor_mean_c, held_out.indoor_mean_c)
+        if use_weather:
+            terms = fit_weather_terms(model, others)
+            if terms is not None:
+                predicted = max(
+                    0.0,
+                    predicted
+                    + terms.adjustment(
+                        model,
+                        held_out.outdoor_mean_c,
+                        held_out.indoor_mean_c,
+                        held_out.wind_kmh,
+                        held_out.sun_mj,
+                    ),
+                )
         errors.append(7 * (predicted - held_out.litres_used))
     absolute = sorted(abs(error) for error in errors)
     middle = len(absolute) // 2
@@ -827,3 +861,111 @@ def backtest_weekly(samples: Sequence[DailyTrainingSample]) -> BacktestResult | 
         bias_litres=sum(errors) / len(errors),
         mean_weekly_use_litres=7 * sum(s.litres_used for s in samples) / len(samples),
     )
+
+
+# --- Wind and sun ----------------------------------------------------------------
+MIN_WEATHER_WEEKS = 12
+MIN_WEATHER_GAIN = 0.03  # weather terms must cut the backtest error by 3 %
+
+
+@dataclass(frozen=True)
+class WeatherTerms:
+    """Extra oil per degree of heating for windier or duller weather than usual.
+
+    Both effects scale with how hard the heating is working (degrees of
+    indoor/outdoor gap above the switch-off point), so they vanish when the
+    heating is off.
+    """
+
+    wind_litres_per_degree_kmh: float  # >= 0: wind strips heat
+    sun_litres_per_degree_mj: float  # <= 0: sun adds heat
+    wind_mean_kmh: float
+    sun_mean_mj: float
+    weeks: int
+
+    def adjustment(
+        self,
+        model: UsageModel,
+        outdoor_mean_c: float,
+        indoor_c: float,
+        wind_kmh: float | None,
+        sun_mj: float | None,
+    ) -> float:
+        """Litres per day to add to the base prediction for this weather."""
+        degrees = _heating_degrees(model, outdoor_mean_c, indoor_c)
+        extra = 0.0
+        if wind_kmh is not None:
+            extra += self.wind_litres_per_degree_kmh * degrees * (wind_kmh - self.wind_mean_kmh)
+        if sun_mj is not None:
+            extra += self.sun_litres_per_degree_mj * degrees * (sun_mj - self.sun_mean_mj)
+        return extra
+
+
+def _heating_degrees(model: UsageModel, outdoor_mean_c: float, indoor_c: float) -> float:
+    """Degrees of temperature gap above the heating switch-off point."""
+    return max(0.0, max(0.0, indoor_c - outdoor_mean_c) - model.runtime_switch_off_gap_c)
+
+
+def fit_weather_terms(
+    model: UsageModel, samples: Sequence[DailyTrainingSample]
+) -> WeatherTerms | None:
+    """Fit wind and sun effects to what the temperature model leaves unexplained.
+
+    Uses weeks that have wind and sun data. Coefficients with a physically
+    wrong sign (wind saving oil, sun costing oil) are set to zero. Returns
+    None with too few weeks or no heating weeks.
+    """
+    rows = [s for s in samples if s.wind_kmh is not None and s.sun_mj is not None]
+    if len(rows) < MIN_WEATHER_WEEKS:
+        return None
+    degrees = [_heating_degrees(model, s.outdoor_mean_c, s.indoor_mean_c) for s in rows]
+    total_degrees = sum(degrees)
+    if total_degrees <= 0:
+        return None
+    # Averages weighted by heating effort: "usual" weather while heating.
+    wind_mean = sum(d * s.wind_kmh for d, s in zip(degrees, rows)) / total_degrees
+    sun_mean = sum(d * s.sun_mj for d, s in zip(degrees, rows)) / total_degrees
+    x_wind = [d * (s.wind_kmh - wind_mean) for d, s in zip(degrees, rows)]
+    x_sun = [d * (s.sun_mj - sun_mean) for d, s in zip(degrees, rows)]
+    residual = [
+        s.litres_used - predict_day(model, s.outdoor_mean_c, s.indoor_mean_c)[1]
+        for s in rows
+    ]
+
+    def single(x: list[float]) -> float:
+        denominator = sum(v * v for v in x)
+        return sum(v * r for v, r in zip(x, residual)) / denominator if denominator > 0 else 0.0
+
+    sww = sum(v * v for v in x_wind)
+    sss = sum(v * v for v in x_sun)
+    sws = sum(a * b for a, b in zip(x_wind, x_sun))
+    swr = sum(v * r for v, r in zip(x_wind, residual))
+    ssr = sum(v * r for v, r in zip(x_sun, residual))
+    determinant = sww * sss - sws * sws
+    if determinant > 1e-12:
+        wind_coef = (swr * sss - ssr * sws) / determinant
+        sun_coef = (ssr * sww - swr * sws) / determinant
+    else:
+        wind_coef, sun_coef = single(x_wind), 0.0
+    if wind_coef < 0 and sun_coef > 0:
+        wind_coef = sun_coef = 0.0
+    elif wind_coef < 0:
+        wind_coef, sun_coef = 0.0, min(0.0, single(x_sun))
+    elif sun_coef > 0:
+        wind_coef, sun_coef = max(0.0, single(x_wind)), 0.0
+    return WeatherTerms(
+        wind_litres_per_degree_kmh=wind_coef,
+        sun_litres_per_degree_mj=sun_coef,
+        wind_mean_kmh=wind_mean,
+        sun_mean_mj=sun_mean,
+        weeks=len(rows),
+    )
+
+
+def weather_terms_help(
+    base: BacktestResult | None, with_weather: BacktestResult | None
+) -> bool:
+    """True when wind and sun measurably improved past weekly forecasts."""
+    if base is None or with_weather is None or base.rmse_litres <= 0:
+        return False
+    return with_weather.rmse_litres <= base.rmse_litres * (1 - MIN_WEATHER_GAIN)

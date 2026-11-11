@@ -33,6 +33,8 @@ climate_offset = MODEL["climate_offset"]
 historical_year_temperatures = MODEL["historical_year_temperatures"]
 pick_scenarios = MODEL["pick_scenarios"]
 backtest_weekly = MODEL["backtest_weekly"]
+fit_weather_terms = MODEL["fit_weather_terms"]
+weather_terms_help = MODEL["weather_terms_help"]
 temperature_corrected_distance = MODEL["temperature_corrected_distance"]
 
 
@@ -448,6 +450,73 @@ class TestBacktest(unittest.TestCase):
         """With only the minimum weeks there is nothing to hold out."""
         self.assertIsNone(backtest_weekly(make_training_samples()[:MIN_TRAINING_WEEKS]))
         self.assertIsNotNone(backtest_weekly(make_training_samples()[: MIN_TRAINING_WEEKS + 1]))
+
+
+
+def make_weather_samples(wind_effect: float, sun_effect: float) -> list[object]:
+    """Weekly samples whose oil use also depends on wind and sun while heating."""
+    import random
+
+    rng = random.Random(3)
+    samples = []
+    for index in range(40):
+        outdoor = 1.0 + (index * 5) % 17
+        wind = 6 + rng.uniform(0, 16)
+        sun = 1 + rng.uniform(0, 9)
+        gap = 20.0 - outdoor
+        degrees = max(0.0, gap - 4.0)  # heating off above 16 degrees
+        litres = 1.5 + 0.9 * degrees
+        litres += degrees * (wind_effect * (wind - 14) + sun_effect * (sun - 5.5))
+        litres += rng.uniform(-0.15, 0.15)
+        samples.append(
+            DailyTrainingSample(
+                outdoor_mean_c=outdoor,
+                indoor_mean_c=20.0,
+                heating_hours=None,
+                litres_used=max(0.0, litres),
+                wind_kmh=wind,
+                sun_mj=sun,
+            )
+        )
+    return samples
+
+
+class TestWindAndSun(unittest.TestCase):
+    """Verify wind and sun effects are learned only when they are real."""
+
+    def test_recovers_wind_and_sun_effects(self) -> None:
+        """Known effects are recovered with the right signs and sizes."""
+        samples = make_weather_samples(wind_effect=0.012, sun_effect=-0.02)
+        model = fit_usage_model(samples)
+        terms = fit_weather_terms(model, samples)
+        self.assertAlmostEqual(terms.wind_litres_per_degree_kmh, 0.012, delta=0.003)
+        self.assertAlmostEqual(terms.sun_litres_per_degree_mj, -0.02, delta=0.005)
+        base = backtest_weekly(samples)
+        with_weather = backtest_weekly(samples, use_weather=True)
+        self.assertLess(with_weather.rmse_litres, base.rmse_litres * 0.6)
+        self.assertTrue(weather_terms_help(base, with_weather))
+
+    def test_no_effect_means_terms_stay_off(self) -> None:
+        """When wind and sun make no difference, they fail the improvement test."""
+        samples = make_weather_samples(wind_effect=0.0, sun_effect=0.0)
+        self.assertFalse(
+            weather_terms_help(backtest_weekly(samples), backtest_weekly(samples, use_weather=True))
+        )
+
+    def test_no_adjustment_when_heating_is_off(self) -> None:
+        """Wind and sun change nothing on days too warm for heating."""
+        samples = make_weather_samples(wind_effect=0.012, sun_effect=-0.02)
+        model = fit_usage_model(samples)
+        terms = fit_weather_terms(model, samples)
+        self.assertEqual(terms.adjustment(model, 19.0, 20.0, 40.0, 0.0), 0.0)
+        self.assertGreater(terms.adjustment(model, 2.0, 20.0, 30.0, 5.5), 0.0)
+        self.assertEqual(terms.adjustment(model, 2.0, 20.0, None, None), 0.0)
+
+    def test_needs_enough_weeks_with_weather(self) -> None:
+        """Too few weeks with wind and sun data gives no terms."""
+        samples = make_weather_samples(0.012, -0.02)
+        model = fit_usage_model(samples)
+        self.assertIsNone(fit_weather_terms(model, samples[:8]))
 
 
 if __name__ == "__main__":

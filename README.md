@@ -65,6 +65,8 @@ Choose the temperature sensors, thermostat and weather forecast, and optionally 
 ### Winter scenarios and your location
 To project mild, typical and cold winters, Oil Monitor downloads about 25 years of daily temperatures for your area from [Open-Meteo](https://open-meteo.com) (free, no account). You can enter a **town or the first part of your postcode**, or leave it empty to use Home Assistant's home location. Either way, only a location rounded to about 10 km is sent, and for UK postcodes only the first half (e.g. `YO10`) is looked up. The download happens about once a month and is stored in Home Assistant.
 
+The same service provides wind and sunshine for the last 13 months and the coming week. Oil Monitor tests whether including them would have predicted your past weeks more accurately, and only uses them if they do. The **Setup check** shows the result.
+
 You can switch this off in setup. Oil Monitor then stays fully local and bases the scenarios on last year's temperatures, 2 °C warmer and colder.
 
 ### Changing settings later
