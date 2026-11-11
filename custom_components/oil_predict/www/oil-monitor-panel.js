@@ -431,4 +431,11 @@ class OilMonitorPanel extends HTMLElement {
   }
 }
 
-customElements.define("oil-monitor-panel", OilMonitorPanel);
+// Each build registers its own element name (taken from the ?v= build id in
+// this module's URL). An element name can only be defined once per page, so
+// a fixed name would let an older cached copy keep rendering after updates.
+const BUILD_ID = new URL(import.meta.url).searchParams.get("v");
+const ELEMENT_NAME = BUILD_ID ? `oil-monitor-panel-${BUILD_ID}` : "oil-monitor-panel";
+if (!customElements.get(ELEMENT_NAME)) {
+  customElements.define(ELEMENT_NAME, OilMonitorPanel);
+}

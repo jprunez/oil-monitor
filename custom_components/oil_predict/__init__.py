@@ -71,7 +71,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     await async_register_panel(
         hass,
         frontend_url_path=PANEL_PATH,
-        webcomponent_name=PANEL_COMPONENT,
+        webcomponent_name=f"{PANEL_COMPONENT}-{build_id}",
         sidebar_title="Oil Monitor",
         sidebar_icon="mdi:oil",
         module_url=f"{PANEL_MODULE_URL}?v={build_id}",
