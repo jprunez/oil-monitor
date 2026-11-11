@@ -222,3 +222,88 @@ async def test_thermostat_chosen_as_indoor_sensor(hass: HomeAssistant) -> None:
     assert diagnostics["model"]["sample_count"] >= 12
     assert diagnostics["sources"]["weather_entity"] == {"entity_id": "weather.missing", "found": False}
     assert diagnostics["setup_check"] == attributes["setup_check"]
+
+
+@pytest.mark.parametrize(("drift_per_c", "expect_active"), [(0.0017, True), (0.0, False)])
+async def test_ultrasonic_temperature_correction(
+    hass: HomeAssistant, drift_per_c: float, expect_active: bool
+) -> None:
+    """Drift in the recorded readings switches the correction on; none leaves it off."""
+    import math
+
+    from custom_components.oil_predict.model import (
+        TankConfig,
+        reading_to_litres,
+        temperature_corrected_distance,
+    )
+
+    hours = _hours()
+    first = hours[0]
+
+    def temp_on(day: int) -> float:
+        return 8 + 6 * math.sin(day / 5.0) + 3 * math.sin(day * 1.7)
+
+    depth_rows, outdoor_rows, indoor_rows = [], [], []
+    true_distance = 30.0
+    for hour in hours:
+        day = int((hour - first).total_seconds() // 86400)
+        temp = temp_on(day)
+        true_distance += max(0.0, 0.05 + 0.02 * (18 - temp)) / 3 / 24
+        measured = true_distance * (1 - drift_per_c * (temp - 10))
+        depth_rows.append({"start": hour, "mean": measured, "min": measured, "max": measured})
+        outdoor_rows.append({"start": hour, "mean": temp, "min": temp, "max": temp})
+        indoor_rows.append({"start": hour, "mean": 19.5, "min": 19.5, "max": 19.5})
+    async_import_statistics(hass, _metadata("sensor.tank_depth", "cm", mean=True), depth_rows)
+    async_import_statistics(hass, _metadata("sensor.outdoor", "°C", mean=True), outdoor_rows)
+    async_import_statistics(hass, _metadata("sensor.indoor", "°C", mean=True), indoor_rows)
+    await async_wait_recording_done(hass)
+
+    hass.states.async_set("sensor.tank_depth", "60", {"unit_of_measurement": "cm", "state_class": "measurement"})
+    hass.states.async_set("sensor.outdoor", "-2", {"unit_of_measurement": "°C", "state_class": "measurement"})
+    hass.states.async_set("sensor.indoor", "19.5", {"unit_of_measurement": "°C", "state_class": "measurement"})
+    hass.states.async_set("climate.home", "heat", {"temperature": 19})
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        version=2,
+        unique_id=DOMAIN,
+        data={
+            "depth_entity": "sensor.tank_depth",
+            "level_type": "distance",
+            "tank_capacity": 1000,
+            "tank_shape": "vertical",
+            "full_distance_cm": 10,
+            "empty_distance_cm": 130,
+            "outdoor_entity": "sensor.outdoor",
+            "indoor_entity": "sensor.indoor",
+            "indoor_target_entity": "climate.home",
+            "weather_entity": "weather.home",
+            "stale_after_minutes": 90,
+        },
+    )
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    registry = er.async_get(hass)
+    stale = hass.states.get(
+        registry.async_get_entity_id("binary_sensor", DOMAIN, f"{entry.entry_id}_tank_sensor_stale")
+    )
+    correction = stale.attributes["temp_correction"]
+    assert correction["checked"] is True
+    assert correction["active"] is expect_active, correction
+    rows = {row["role"]: row for row in stale.attributes["setup_check"]}
+    assert rows["temp_correction"]["message"].startswith("On." if expect_active else "Not needed.")
+
+    tank = TankConfig(
+        capacity_litres=1000, shape="vertical", full_distance_cm=10, empty_distance_cm=130
+    )
+    reading = 60.0
+    if expect_active:
+        assert correction["coefficient_per_c"] == pytest.approx(0.0017, abs=0.0004)
+        # It is -2 °C now: the raw 60 cm reads long, so the corrected tank is fuller.
+        reading = temperature_corrected_distance(60.0, -2.0, correction["reference_c"])
+        assert reading < 59.5
+    litres = hass.states.get(
+        registry.async_get_entity_id("sensor", DOMAIN, f"{entry.entry_id}_litres_remaining")
+    )
+    assert float(litres.state) == pytest.approx(reading_to_litres(reading, tank), abs=0.01)

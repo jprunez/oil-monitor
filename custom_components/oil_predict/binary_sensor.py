@@ -32,7 +32,7 @@ class OilTankSensorStaleBinarySensor(
     _attr_has_entity_name = True
     _attr_name = "Tank sensor stale"
     _attr_device_class = BinarySensorDeviceClass.PROBLEM
-    _unrecorded_attributes = frozenset({"setup_check", "history_days"})
+    _unrecorded_attributes = frozenset({"setup_check", "history_days", "temp_correction"})
 
     def __init__(
         self, coordinator: OilPredictCoordinator, entry: ConfigEntry
@@ -59,5 +59,6 @@ class OilTankSensorStaleBinarySensor(
             "training_weeks_needed": data["training_weeks_needed"],
             "history_days": data["history_days"],
             "setup_check": data["setup_check"],
+            "temp_correction": data["temp_correction"],
             "forecast_warning": data["forecast_warning"],
         }

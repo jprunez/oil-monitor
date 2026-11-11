@@ -23,6 +23,7 @@ Oil Monitor tells you how much heating oil is in your tank, how much you are lik
 | Thermostat | Yes | Your thermostat (climate entity) or a sensor holding its target temperature. |
 | Weather forecast | Yes | A weather entity with 7 daily forecasts (most weather integrations provide this). |
 | Daily heating runtime sensor | Optional | Hours the heating has run today, resetting each day. Makes estimates more accurate. |
+| Tank temperature sensor | Optional | Air temperature at the tank sensor. Used to correct ultrasonic readings, which read slightly long in cold air (about 2 cm over a 20 °C swing). Oil Monitor checks your history and only corrects if your sensor actually drifts. Without this sensor the outdoor temperature is used. |
 | Tank measurement time sensor | Optional | When the tank sensor actually took its reading. Useful for radio/MQTT sensors that resend old readings. |
 
 **Important:** the tank, outdoor and indoor sensors (and the runtime sensor if you use one) must keep **long-term statistics**. That means they need a *state class* of `measurement`. You can check under **Developer tools → Statistics**: each sensor should be listed there. Without statistics there is no history, so no charts or estimates.

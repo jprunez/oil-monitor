@@ -18,6 +18,7 @@ CONF_TIMESTAMP_ENTITY = "timestamp_entity"  # optional
 CONF_OUTDOOR_ENTITY = "outdoor_entity"
 CONF_INDOOR_ENTITY = "indoor_entity"
 CONF_RUNTIME_ENTITY = "runtime_entity"  # optional
+CONF_TANK_TEMP_ENTITY = "tank_temp_entity"  # optional
 CONF_INDOOR_TARGET_ENTITY = "indoor_target_entity"
 CONF_WEATHER_ENTITY = "weather_entity"
 CONF_STALE_AFTER_MINUTES = "stale_after_minutes"

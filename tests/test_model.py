@@ -28,6 +28,8 @@ parse_sample_timestamp = MODEL["parse_sample_timestamp"]
 seasonal_outdoor_c = MODEL["seasonal_outdoor_c"]
 days_until_level = MODEL["days_until_level"]
 MIN_TRAINING_WEEKS = MODEL["MIN_TRAINING_WEEKS"]
+estimate_temperature_drift = MODEL["estimate_temperature_drift"]
+temperature_corrected_distance = MODEL["temperature_corrected_distance"]
 
 
 def make_training_samples(with_runtime: bool = True) -> list[object]:
@@ -310,6 +312,53 @@ class TestRunOutProjection(unittest.TestCase):
         }
         self.assertAlmostEqual(seasonal_outdoor_c(history, date(2026, 12, 1)), 0.0)
         self.assertIsNone(seasonal_outdoor_c(history, date(2026, 6, 1)))
+
+
+
+def make_drift_days(drift_per_c: float, days: int = 200) -> list[tuple]:
+    """Daily (day, measured distance, air temperature) with known sensor drift."""
+    import math
+    import random
+
+    rng = random.Random(7)
+    out = []
+    true_distance = 30.0
+    for index in range(days):
+        temp = 8 + 6 * math.sin(index / 5.0) + rng.uniform(-3, 3)
+        # Colder days burn more oil, so the true distance grows faster.
+        true_distance += max(0.0, 0.05 + 0.02 * (18 - temp)) / 3
+        measured = true_distance * (1 - drift_per_c * (temp - 10)) + rng.uniform(-0.05, 0.05)
+        out.append((date(2026, 1, 1) + timedelta(days=index), measured, temp))
+    return out
+
+
+class TestTemperatureDrift(unittest.TestCase):
+    """Verify detection and correction of ultrasonic temperature drift."""
+
+    def test_detects_uncompensated_sensor(self) -> None:
+        """A sensor drifting 0.17 %/°C is found and flagged for correction."""
+        estimate = estimate_temperature_drift(make_drift_days(0.0017))
+        self.assertAlmostEqual(estimate.coefficient_per_c, 0.0017, delta=0.0003)
+        self.assertTrue(estimate.needs_correction)
+
+    def test_leaves_compensated_sensor_alone(self) -> None:
+        """A sensor that already compensates shows no drift, so no correction."""
+        estimate = estimate_temperature_drift(make_drift_days(0.0))
+        self.assertFalse(estimate.needs_correction)
+
+    def test_needs_enough_history(self) -> None:
+        """Too few days gives no estimate."""
+        self.assertIsNone(estimate_temperature_drift(make_drift_days(0.0017, days=10)))
+
+    def test_correction_removes_the_drift(self) -> None:
+        """Correcting to a reference temperature undoes the cold-air error."""
+        true_distance = 60.0
+        cold_reading = true_distance / temperature_corrected_distance(1.0, 0.0, 15.0)
+        self.assertGreater(cold_reading, true_distance + 1.0)  # reads over 1 cm long
+        self.assertAlmostEqual(
+            temperature_corrected_distance(cold_reading, 0.0, 15.0), true_distance
+        )
+        self.assertAlmostEqual(temperature_corrected_distance(60.0, 15.0, 15.0), 60.0)
 
 
 if __name__ == "__main__":

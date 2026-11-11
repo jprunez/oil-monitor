@@ -35,6 +35,7 @@ from .const import (
     CONF_STALE_AFTER_MINUTES,
     CONF_TANK_CAPACITY,
     CONF_TANK_SHAPE,
+    CONF_TANK_TEMP_ENTITY,
     CONF_TIMESTAMP_ENTITY,
     CONF_WEATHER_ENTITY,
     DOMAIN,
@@ -55,6 +56,7 @@ from .model import (
     WeeklyForecast,
     build_training_samples,
     days_until_level,
+    estimate_temperature_drift,
     fit_usage_model,
     parse_calibration,
     reading_to_litres,
@@ -62,6 +64,7 @@ from .model import (
     parse_sample_timestamp,
     predict_day,
     seasonal_outdoor_c,
+    temperature_corrected_distance,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -122,6 +125,8 @@ class OilPredictCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._target_source: str | None = None
         self._history_days: dict[str, int] = {}
         self._indoor_fallback_c: float | None = None
+        # Ultrasonic temperature correction, decided from the history.
+        self.temp_correction: dict[str, Any] = {"active": False, "checked": False}
         self._weather_error: str | None = None
         self.model: UsageModel | None = None
         self._history_entities: dict[str, str] = {}
@@ -261,11 +266,14 @@ class OilPredictCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "outdoor": "outdoor temperature",
             "indoor": "indoor temperature",
             "runtime": "heating runtime",
+            "tank_temp": "tank temperature",
         }
         missing = [
             f"{labels[role]} ({self._history_entities[role]})"
             for role, days in self._history_days.items()
-            if days == 0 and not (role == "indoor" and self._indoor_fallback_c is not None)
+            if days == 0
+            and role != "tank_temp"
+            and not (role == "indoor" and self._indoor_fallback_c is not None)
         ]
         if missing:
             return (
@@ -292,6 +300,8 @@ class OilPredictCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         ]
         if config.get(CONF_RUNTIME_ENTITY):
             items.append(("runtime", "Heating runtime", config[CONF_RUNTIME_ENTITY]))
+        if config.get(CONF_TANK_TEMP_ENTITY):
+            items.append(("tank_temp", "Tank temperature", config[CONF_TANK_TEMP_ENTITY]))
         if config.get(CONF_TIMESTAMP_ENTITY):
             items.append(("timestamp", "Measurement time", config[CONF_TIMESTAMP_ENTITY]))
 
@@ -319,7 +329,7 @@ class OilPredictCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 problems.append(f"Currently {state.state}.")
             else:
                 unit = state.attributes.get("unit_of_measurement")
-                if role in ("level", "outdoor", "indoor", "runtime"):
+                if role in ("level", "outdoor", "indoor", "runtime", "tank_temp"):
                     try:
                         float(state.state)
                     except ValueError:
@@ -329,7 +339,7 @@ class OilPredictCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         f"Its unit is {unit}, but Oil Monitor is set up for "
                         f"{level_names[self.tank.level_type]}. Check the sensor type under Configure."
                     )
-                if role in ("outdoor", "indoor") and unit not in (
+                if role in ("outdoor", "indoor", "tank_temp") and unit not in (
                     UnitOfTemperature.CELSIUS,
                     UnitOfTemperature.FAHRENHEIT,
                 ):
@@ -340,7 +350,7 @@ class OilPredictCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     problems.append(self._weather_error)
                 if role == "timestamp" and parse_sample_timestamp(state.state) is None:
                     problems.append(f"Its value \"{state.state}\" is not a recognisable time.")
-                if role in ("level", "outdoor", "indoor", "runtime"):
+                if role in ("level", "outdoor", "indoor", "runtime", "tank_temp"):
                     no_class = state.attributes.get("state_class") is None
                     fallback = role == "indoor" and self._indoor_fallback_c is not None
                     if no_class or days == 0:
@@ -355,6 +365,11 @@ class OilPredictCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                                 f"{reason} Past weeks are assumed to have been "
                                 f"{self._indoor_fallback_c:.1f} °C indoors; choose a "
                                 "sensor with history under Configure for better estimates."
+                            )
+                        elif role == "tank_temp":
+                            notes.append(
+                                f"{reason} The outdoor temperature is used for the "
+                                "tank reading correction instead."
                             )
                         elif role == "outdoor":
                             notes.append(f"{reason} Charts and estimates need it.")
@@ -373,6 +388,32 @@ class OilPredictCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     "status": status,
                     "message": message,
                     "history_days": days,
+                }
+            )
+        if self.tank.level_type == LEVEL_DISTANCE:
+            correction = self.temp_correction
+            if correction["active"]:
+                message = (
+                    f"On. Your tank readings drift about "
+                    f"{correction['coefficient_per_c'] * 100:.2f} % per °C (found in "
+                    f"{correction['day_pairs']} days of history), so they are "
+                    f"corrected to {correction['reference_c']:.0f} °C."
+                )
+            elif correction["checked"]:
+                message = (
+                    "Not needed. Your tank readings don't drift with temperature, "
+                    "so the sensor already compensates."
+                )
+            else:
+                message = "Not enough history yet to check for temperature drift."
+            rows.append(
+                {
+                    "role": "temp_correction",
+                    "label": "Temperature correction",
+                    "entity_id": correction.get("entity_id") or "",
+                    "status": "ok",
+                    "message": message,
+                    "history_days": None,
                 }
             )
         return rows
@@ -516,7 +557,9 @@ class OilPredictCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         litres_remaining = None
         if reading is not None:
             try:
-                litres_remaining = reading_to_litres(reading, self.tank)
+                litres_remaining = reading_to_litres(
+                    self._corrected_reading(reading), self.tank
+                )
             except ValueError:
                 _LOGGER.debug("Ignoring invalid tank reading: %s", reading)
 
@@ -534,6 +577,7 @@ class OilPredictCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "training_weeks_needed": MIN_TRAINING_WEEKS,
             "history_days": dict(self._history_days),
             "indoor_history_fallback_c": self._indoor_fallback_c,
+            "temp_correction": dict(self.temp_correction),
             "setup_check": self.setup_check(),
             "forecast_warning": self._forecast_warning,
             "temperature_offset_c": self.temperature_offset_c,
@@ -581,6 +625,8 @@ class OilPredictCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         }
         if self.entry.data.get(CONF_RUNTIME_ENTITY):
             role_to_entity["runtime"] = self.entry.data[CONF_RUNTIME_ENTITY]
+        if self.entry.data.get(CONF_TANK_TEMP_ENTITY):
+            role_to_entity["tank_temp"] = self.entry.data[CONF_TANK_TEMP_ENTITY]
         entity_ids = set(role_to_entity.values())
         result = await get_instance(self.hass).async_add_executor_job(
             partial(
@@ -619,7 +665,7 @@ class OilPredictCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         # Without any indoor history, assume the house was kept at today's
         # thermostat setting (or current indoor temperature) in past weeks.
-        required = set(role_to_entity)
+        required = set(role_to_entity) - {"tank_temp"}
         self._indoor_fallback_c = None
         if self._history_days.get("indoor") == 0:
             fallback = self._read_temperature_c(
@@ -646,6 +692,7 @@ class OilPredictCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 )
             outdoor_history[day] = outdoor
         self._outdoor_history = outdoor_history
+        air_temps = self._update_temp_correction(daily, outdoor_history)
         for day, values in sorted(daily.items()):
             if not all(key in values for key in required):
                 continue
@@ -667,7 +714,12 @@ class OilPredictCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     UnitOfTemperature.CELSIUS,
                 )
             try:
-                litres = reading_to_litres(values["level"], self.tank)
+                level = values["level"]
+                if self.temp_correction["active"] and day in air_temps:
+                    level = temperature_corrected_distance(
+                        level, air_temps[day], self.temp_correction["reference_c"]
+                    )
+                litres = reading_to_litres(level, self.tank)
             except ValueError:
                 continue
             history.append(
@@ -681,6 +733,71 @@ class OilPredictCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             )
 
         return build_training_samples(history, self.tank.capacity_litres)
+
+    def _update_temp_correction(
+        self,
+        daily: Mapping[date, Mapping[str, float]],
+        outdoor_history: Mapping[date, float],
+    ) -> dict[date, float]:
+        """Decide from history whether distance readings need temperature correction.
+
+        Returns the air temperature (°C) to use for each day: the tank
+        temperature sensor when it has history, otherwise outdoor temperature.
+        """
+        entity_id = self.entry.data[CONF_OUTDOOR_ENTITY]
+        air_temps: dict[date, float] = dict(outdoor_history)
+        tank_temp_entity = self.entry.data.get(CONF_TANK_TEMP_ENTITY)
+        if tank_temp_entity and self._history_days.get("tank_temp"):
+            fahrenheit = self._entity_unit(tank_temp_entity) == UnitOfTemperature.FAHRENHEIT
+            air_temps = {
+                day: (
+                    TemperatureConverter.convert(
+                        values["tank_temp"],
+                        UnitOfTemperature.FAHRENHEIT,
+                        UnitOfTemperature.CELSIUS,
+                    )
+                    if fahrenheit
+                    else values["tank_temp"]
+                )
+                for day, values in daily.items()
+                if "tank_temp" in values
+            }
+            entity_id = tank_temp_entity
+
+        self.temp_correction = {"active": False, "checked": False, "entity_id": entity_id}
+        if self.tank.level_type != LEVEL_DISTANCE:
+            return air_temps
+        samples = [
+            (day, values["level"], air_temps[day])
+            for day, values in daily.items()
+            if "level" in values and day in air_temps
+        ]
+        estimate = estimate_temperature_drift(samples)
+        if estimate is None:
+            return air_temps
+        self.temp_correction.update(
+            {
+                "checked": True,
+                "active": estimate.needs_correction,
+                "coefficient_per_c": round(estimate.coefficient_per_c, 5),
+                "t_statistic": round(estimate.t_statistic, 1),
+                "day_pairs": estimate.day_pairs,
+                # Correct to the average temperature, so typical readings
+                # (and the tank calibration) stay where they were.
+                "reference_c": float(round(sum(t for _, _, t in samples) / len(samples))),
+            }
+        )
+        return air_temps
+
+    def _corrected_reading(self, reading: float) -> float:
+        """Apply the temperature correction to a live distance reading."""
+        correction = self.temp_correction
+        if not correction.get("active"):
+            return reading
+        air_temp = self._read_temperature_c(correction["entity_id"])
+        if air_temp is None:
+            return reading
+        return temperature_corrected_distance(reading, air_temp, correction["reference_c"])
 
     def _entity_unit(self, entity_id: str) -> str | None:
         """Return the current unit of a configured Home Assistant entity."""

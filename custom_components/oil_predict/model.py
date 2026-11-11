@@ -573,3 +573,120 @@ def days_until_level(
             return index + remaining / use
         remaining -= use
     return None
+
+
+# --- Ultrasonic temperature drift -------------------------------------------
+# An ultrasonic sensor times an echo and assumes a fixed speed of sound. Sound
+# is slower in cold air, so the measured distance grows by about 0.17 % per
+# degree Celsius of cooling unless the sensor compensates for it itself.
+PHYSICAL_DRIFT_PER_C = 1 / (2 * 293.15)
+MIN_DRIFT_PER_C = 0.0006
+MAX_DRIFT_PER_C = 0.0030
+MIN_DRIFT_T_STAT = 3.0
+MIN_DRIFT_DAYS = 30
+
+
+@dataclass(frozen=True)
+class DriftEstimate:
+    """How strongly distance readings follow air temperature in the history."""
+
+    coefficient_per_c: float  # fractional distance change per degree of cooling
+    t_statistic: float
+    day_pairs: int
+
+    @property
+    def needs_correction(self) -> bool:
+        """True when the drift is clear and close to the physical value."""
+        return (
+            self.day_pairs >= MIN_DRIFT_DAYS
+            and self.t_statistic >= MIN_DRIFT_T_STAT
+            and MIN_DRIFT_PER_C <= self.coefficient_per_c <= MAX_DRIFT_PER_C
+        )
+
+
+def temperature_corrected_distance(
+    measured_cm: float, air_temp_c: float, reference_temp_c: float
+) -> float:
+    """Correct an ultrasonic distance for the air temperature it was taken at.
+
+    The result is the distance the sensor would have reported at
+    ``reference_temp_c``.
+    """
+    return measured_cm * math.sqrt(
+        (273.15 + air_temp_c) / (273.15 + reference_temp_c)
+    )
+
+
+def _solve_3x3(matrix: list[list[float]], vector: list[float]) -> list[float] | None:
+    """Solve a 3x3 linear system by Gaussian elimination."""
+    a = [row[:] + [value] for row, value in zip(matrix, vector)]
+    for col in range(3):
+        pivot = max(range(col, 3), key=lambda r: abs(a[r][col]))
+        if abs(a[pivot][col]) < 1e-12:
+            return None
+        a[col], a[pivot] = a[pivot], a[col]
+        for row in range(3):
+            if row != col:
+                factor = a[row][col] / a[col][col]
+                a[row] = [x - factor * y for x, y in zip(a[row], a[col])]
+    return [a[i][3] / a[i][i] for i in range(3)]
+
+
+def estimate_temperature_drift(
+    days: Sequence[tuple[date, float, float]],
+) -> DriftEstimate | None:
+    """Estimate temperature drift from daily (day, distance_cm, air_temp_c).
+
+    Looks at consecutive days: real oil use depends on how cold it is, while
+    sensor drift follows the *change* in temperature from one day to the
+    next. Fits  change/distance = a + b*temperature - k*temperature_change
+    and returns k with its t-statistic. Returns None with too little data.
+    """
+    by_day = {day: (distance, temp) for day, distance, temp in days}
+    rows: list[tuple[float, float, float]] = []  # (temp level, temp change, y)
+    for day, (distance, temp) in by_day.items():
+        previous = by_day.get(day - timedelta(days=1))
+        if previous is None:
+            continue
+        prev_distance, prev_temp = previous
+        if not all(
+            math.isfinite(v) for v in (distance, temp, prev_distance, prev_temp)
+        ) or min(distance, prev_distance) <= 0:
+            continue
+        mean_distance = (distance + prev_distance) / 2
+        change = (distance - prev_distance) / mean_distance
+        # Skip deliveries and sensor jumps; drift is a fraction of a percent.
+        if abs(change) > 0.05:
+            continue
+        rows.append(((temp + prev_temp) / 2, temp - prev_temp, change))
+
+    n = len(rows)
+    if n < MIN_DRIFT_DAYS:
+        return None
+
+    # Ordinary least squares with predictors [1, level, change].
+    xtx = [[0.0] * 3 for _ in range(3)]
+    xty = [0.0] * 3
+    for level, delta, y in rows:
+        x = (1.0, level, delta)
+        for i in range(3):
+            xty[i] += x[i] * y
+            for j in range(3):
+                xtx[i][j] += x[i] * x[j]
+    beta = _solve_3x3(xtx, xty)
+    if beta is None:
+        return None
+    residual = sum(
+        (y - (beta[0] + beta[1] * level + beta[2] * delta)) ** 2
+        for level, delta, y in rows
+    )
+    # Variance of the temperature-change coefficient: sigma^2 * (X'X)^-1[2][2].
+    inverse_column = _solve_3x3(xtx, [0.0, 0.0, 1.0])
+    if inverse_column is None or n <= 3:
+        return None
+    variance = residual / (n - 3) * inverse_column[2]
+    coefficient = -beta[2]
+    t_statistic = coefficient / math.sqrt(variance) if variance > 0 else math.inf
+    return DriftEstimate(
+        coefficient_per_c=coefficient, t_statistic=t_statistic, day_pairs=n
+    )

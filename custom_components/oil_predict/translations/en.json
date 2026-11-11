@@ -41,7 +41,8 @@
           "weather_entity": "Weather forecast",
           "runtime_entity": "Daily heating runtime sensor (optional)",
           "timestamp_entity": "Tank measurement time sensor (optional)",
-          "stale_after_minutes": "Warn when the tank reading is older than (minutes)"
+          "stale_after_minutes": "Warn when the tank reading is older than (minutes)",
+          "tank_temp_entity": "Tank temperature sensor (optional)"
         },
         "data_description": {
           "outdoor_entity": "A temperature sensor with long-term statistics, in °C or °F.",
@@ -50,7 +51,8 @@
           "weather_entity": "A weather entity that provides seven daily forecasts.",
           "runtime_entity": "Hours the heating has run today, resetting daily. Improves accuracy; leave empty if you don't have one.",
           "timestamp_entity": "When the tank sensor actually took its reading. Useful for radio/MQTT sensors with retained messages; leave empty to use the time Home Assistant received the reading.",
-          "stale_after_minutes": "Set this a little longer than your sensor's normal reporting interval."
+          "stale_after_minutes": "Set this a little longer than your sensor's normal reporting interval.",
+          "tank_temp_entity": "Air temperature at the tank sensor. Ultrasonic sensors read slightly long in cold air; Oil Monitor checks your history for this and corrects it if needed. Leave empty to use the outdoor temperature."
         }
       }
     },
@@ -105,7 +107,8 @@
           "weather_entity": "Weather forecast",
           "runtime_entity": "Daily heating runtime sensor (optional)",
           "timestamp_entity": "Tank measurement time sensor (optional)",
-          "stale_after_minutes": "Warn when the tank reading is older than (minutes)"
+          "stale_after_minutes": "Warn when the tank reading is older than (minutes)",
+          "tank_temp_entity": "Tank temperature sensor (optional)"
         },
         "data_description": {
           "outdoor_entity": "A temperature sensor with long-term statistics, in °C or °F.",
@@ -114,7 +117,8 @@
           "weather_entity": "A weather entity that provides seven daily forecasts.",
           "runtime_entity": "Hours the heating has run today, resetting daily. Improves accuracy; leave empty if you don't have one.",
           "timestamp_entity": "When the tank sensor actually took its reading. Useful for radio/MQTT sensors with retained messages; leave empty to use the time Home Assistant received the reading.",
-          "stale_after_minutes": "Set this a little longer than your sensor's normal reporting interval."
+          "stale_after_minutes": "Set this a little longer than your sensor's normal reporting interval.",
+          "tank_temp_entity": "Air temperature at the tank sensor. Ultrasonic sensors read slightly long in cold air; Oil Monitor checks your history for this and corrects it if needed. Leave empty to use the outdoor temperature."
         }
       }
     },

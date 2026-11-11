@@ -23,6 +23,7 @@ from .const import (
     CONF_INDOOR_TARGET_ENTITY,
     CONF_OUTDOOR_ENTITY,
     CONF_RUNTIME_ENTITY,
+    CONF_TANK_TEMP_ENTITY,
     CONF_TIMESTAMP_ENTITY,
     CONF_WEATHER_ENTITY,
     DOMAIN,
@@ -37,6 +38,7 @@ SOURCE_KEYS = (
     CONF_INDOOR_ENTITY,
     CONF_INDOOR_TARGET_ENTITY,
     CONF_RUNTIME_ENTITY,
+    CONF_TANK_TEMP_ENTITY,
     CONF_WEATHER_ENTITY,
 )
 ATTRIBUTES = (
@@ -101,6 +103,7 @@ async def async_get_config_entry_diagnostics(
             "empty_litres": coordinator.empty_level_litres,
         },
         "setup_check": data.get("setup_check"),
+        "temp_correction": data.get("temp_correction"),
         "sources": {
             key: _source(hass, entry.data.get(key)) for key in SOURCE_KEYS
         },

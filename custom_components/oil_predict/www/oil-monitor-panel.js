@@ -42,6 +42,7 @@ class OilMonitorPanel extends HTMLElement {
       config.outdoor_entity,
       config.indoor_entity,
       config.runtime_entity,
+      this._tempCorrection()?.entity_id,
     ].filter(Boolean);
     try {
       this._statistics = await this._hass.callWS({
@@ -318,6 +319,14 @@ class OilMonitorPanel extends HTMLElement {
     return (capacity * percent) / 100;
   }
 
+  // The ultrasonic temperature correction the integration decided on, if any.
+  _tempCorrection() {
+    const config = this._panel?.config || {};
+    const correction = this._state(this._findEntity(config.stale_entity, "tank sensor stale"))
+      ?.attributes?.temp_correction;
+    return correction?.active && Number.isFinite(correction.reference_c) ? correction : null;
+  }
+
   _dailyRows() {
     const config = this._panel?.config || {};
     const depthId = config.depth_entity;
@@ -336,6 +345,7 @@ class OilMonitorPanel extends HTMLElement {
       ["depth", depthId],
       ["outdoor", outdoorId],
       ["indoor", config.indoor_entity],
+      ["air", this._tempCorrection()?.entity_id],
     ]) {
       for (const row of this._statistics[id] || []) {
         const start = Number(row.start);
@@ -346,6 +356,17 @@ class OilMonitorPanel extends HTMLElement {
         point[key] = row.mean;
         byDay.set(day, point);
       }
+    }
+    const correction = this._tempCorrection();
+    const airIsFahrenheit =
+      correction && this._state(correction.entity_id)?.attributes?.unit_of_measurement === "°F";
+    for (const point of byDay.values()) {
+      let reading = point.depth;
+      if (correction && Number.isFinite(reading) && Number.isFinite(point.air)) {
+        const airC = airIsFahrenheit ? ((point.air - 32) * 5) / 9 : point.air;
+        reading *= Math.sqrt((273.15 + airC) / (273.15 + correction.reference_c));
+      }
+      point.litres = this._readingToLitres(reading);
     }
     return [...byDay.values()].sort((a, b) => a.day.localeCompare(b.day));
   }
@@ -388,12 +409,11 @@ class OilMonitorPanel extends HTMLElement {
         const refill = interval.some(
           (point, index) =>
             index > 0 &&
-            this._readingToLitres(point.depth) - this._readingToLitres(interval[index - 1].depth) >
+            point.litres - interval[index - 1].litres >
               capacity * 0.05,
         );
         const oilUsed =
-          this._readingToLitres(anchor.depth) -
-          this._readingToLitres(days.at(-1).depth);
+          anchor.litres - days.at(-1).litres;
         if (!refill && Number.isFinite(oilUsed) && oilUsed >= 0 && oilUsed <= capacity * 0.3) {
           const indoorDays = days.filter((point) => Number.isFinite(point.indoor));
           weekly.push({
