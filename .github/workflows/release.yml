@@ -1,0 +1,33 @@
+# Publish a GitHub release whenever a version tag (for example v0.1.8) is
+# pushed. HACS uses these releases to offer updates in Home Assistant.
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the tag matches manifest.json
+        run: |
+          manifest_version=$(python3 -c "import json; print(json.load(open('custom_components/oil_predict/manifest.json'))['version'])")
+          if [ "v${manifest_version}" != "${GITHUB_REF_NAME}" ]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} does not match manifest.json version ${manifest_version}"
+            exit 1
+          fi
+
+      - name: Run model tests
+        run: python3 -m unittest discover -s tests -v
+
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${GITHUB_REF_NAME}" --title "Oil Monitor ${GITHUB_REF_NAME}" --generate-notes --verify-tag

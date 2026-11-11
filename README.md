@@ -33,4 +33,10 @@ The measurement timestamp sensor is used for freshness checks because retained M
 
 ## HACS
 
-The repository is not currently ready for HACS publication. HACS requires a public GitHub repository; publishing here would make the source available to anyone. The repository also needs HACS-specific metadata and integration branding before it can be submitted or added as a custom HACS repository.
+Oil Monitor can be installed as a HACS custom repository. Updates are published as GitHub releases, so Home Assistant shows an "update available" notice when a new version is out, and HACS **Redownload** can roll back to an earlier version.
+
+## Publishing a release (maintainers)
+
+1. Bump `version` in `custom_components/oil_predict/manifest.json`, for example to `0.1.8`, and commit it to `main`.
+2. Tag that commit with the same version and push the tag: `git tag v0.1.8 && git push origin v0.1.8`.
+3. The **Release** GitHub Action checks that the tag matches `manifest.json`, runs the tests, and publishes the release with generated notes.
