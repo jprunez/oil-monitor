@@ -27,6 +27,9 @@ def _metadata(statistic_id: str, unit: str, *, mean: bool) -> dict:
         "statistic_id": statistic_id,
         "unit_of_measurement": unit,
     }
+    if "unit_class" in getattr(recorder_models.StatisticMetaData, "__annotations__", {}):
+        # Newer Home Assistant versions require the unit's class.
+        meta["unit_class"] = {"cm": "distance", "°C": "temperature", "h": "duration"}[unit]
     mean_type = getattr(recorder_models, "StatisticMeanType", None)
     if mean_type is not None:  # Home Assistant 2025.4+
         meta["mean_type"] = mean_type.ARITHMETIC if mean else mean_type.NONE
