@@ -300,6 +300,30 @@ class OilMonitorPanel extends HTMLElement {
     </svg>`;
   }
 
+  // Fit litres = base + slope * max(0, switchOff - outdoor): flat hot-water use
+  // above the heating switch-off temperature, rising linearly below it. The
+  // switch-off temperature is chosen by grid search for the best fit.
+  _switchOffFit(rows) {
+    const temps = rows.map((row) => row.outdoor);
+    const lowest = Math.min(...temps);
+    const highest = Math.max(...temps);
+    let best = null;
+    for (let candidate = lowest; candidate <= highest + 0.01; candidate += 0.25) {
+      // Need a few heating weeks below the switch-off to estimate the slope.
+      if (rows.filter((row) => row.outdoor < candidate).length < 3) continue;
+      const xs = rows.map((row) => Math.max(0, candidate - row.outdoor));
+      const meanX = xs.reduce((a, b) => a + b, 0) / xs.length;
+      const meanY = rows.reduce((a, row) => a + row.litres, 0) / rows.length;
+      const varX = xs.reduce((a, x) => a + (x - meanX) ** 2, 0);
+      let slope = varX ? xs.reduce((a, x, i) => a + (x - meanX) * (rows[i].litres - meanY), 0) / varX : 0;
+      slope = Math.max(0, slope);
+      const base = Math.max(0, meanY - slope * meanX);
+      const sse = rows.reduce((a, row, i) => a + (row.litres - (base + slope * xs[i])) ** 2, 0);
+      if (!best || sse < best.sse - 1e-9 * (1 + best.sse)) best = { base, slope, switchOff: candidate, sse };
+    }
+    return best || { base: rows.reduce((a, row) => a + row.litres, 0) / rows.length, slope: 0, switchOff: highest, sse: 0 };
+  }
+
   _scatter(weeks) {
     const valid = weeks.filter((row) => row.litres >= 0 && Number.isFinite(row.outdoor));
     if (valid.length < 4) {
@@ -320,17 +344,21 @@ class OilMonitorPanel extends HTMLElement {
     const maxY = Math.max(10, ...valid.map((row) => row.litres)) * 1.15;
     const px = (value) => left + ((value - minX) / (maxX - minX || 1)) * (width - left - right);
     const py = (value) => top + ((maxY - value) / (maxY - minY)) * (height - top - bottom);
-    const meanX = valid.reduce((sum, row) => sum + row.outdoor, 0) / valid.length;
-    const meanY = valid.reduce((sum, row) => sum + row.litres, 0) / valid.length;
-    const denominator = valid.reduce((sum, row) => sum + (row.outdoor - meanX) ** 2, 0);
-    const slope = denominator ? valid.reduce((sum, row) => sum + (row.outdoor - meanX) * (row.litres - meanY), 0) / denominator : 0;
-    const intercept = meanY - slope * meanX;
-    const trend = `M${px(minX)},${py(intercept + slope * minX)} L${px(maxX)},${py(intercept + slope * maxX)}`;
+    const fit = this._switchOffFit(valid);
+    const curveAt = (temp) => fit.base + fit.slope * Math.max(0, fit.switchOff - temp);
+    const knee = Math.min(maxX, Math.max(minX, fit.switchOff));
+    const trend = `M${px(minX)},${py(curveAt(minX))} L${px(knee)},${py(curveAt(knee))} L${px(maxX)},${py(curveAt(maxX))}`;
+    const showsSwitchOff = fit.switchOff < maxX - 1;
+    const switchOffLabel = showsSwitchOff
+      ? `<line x1="${px(knee)}" y1="${top}" x2="${px(knee)}" y2="${height - bottom}" class="knee-line" />
+      <text x="${px(knee) + 4}" y="${top + 8}" class="axis-label">heating off ≈ ${this._format(fit.switchOff, 0)}°</text>
+      <text x="${width - right}" y="${py(fit.base) - 6}" text-anchor="end" class="axis-label">hot water ≈ ${this._format(fit.base, 0)} L/week</text>`
+      : "";
     const dots = valid.map((row) => `<circle cx="${px(row.outdoor)}" cy="${py(row.litres)}" r="5" class="scatter-dot"><title>${row.day}: ${this._format(row.litres, 1)} L/week at ${this._format(row.outdoor, 1)} °C</title></circle>`).join("");
     return `<svg viewBox="0 0 ${width} ${height}" role="img" aria-label="Weekly oil use compared with outdoor temperature">
       <line x1="${left}" y1="${height - bottom}" x2="${width - right}" y2="${height - bottom}" class="axis" />
       <line x1="${left}" y1="${top}" x2="${left}" y2="${height - bottom}" class="axis" />
-      <path d="${trend}" class="trend-line" />${dots}
+      <path d="${trend}" class="trend-line" />${switchOffLabel}${dots}
       <text x="${left}" y="${height - 8}" class="axis-label">${this._format(minX, 0)}°</text>
       <text x="${width - right}" y="${height - 8}" text-anchor="end" class="axis-label">${this._format(maxX, 0)}° outdoor</text>
       <text x="8" y="${top + 8}" class="axis-label">L/week</text>
@@ -398,7 +426,7 @@ class OilMonitorPanel extends HTMLElement {
     this.shadowRoot.innerHTML = `
       <style>
         :host{display:block;color:var(--primary-text-color);background:var(--primary-background-color);min-height:100%;font-family:var(--paper-font-body1_-_font-family,Roboto,"Noto",sans-serif)}
-        *{box-sizing:border-box}.page{max-width:1180px;margin:0 auto;padding:28px 24px 48px}.top{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;margin-bottom:22px}.eyebrow{color:var(--secondary-text-color);font-size:12px;letter-spacing:.11em;text-transform:uppercase}.title{font-size:clamp(28px,4vw,38px);font-weight:650;margin:5px 0}.subtitle{color:var(--secondary-text-color);margin:0}.grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}.card{background:var(--card-background-color,var(--secondary-background-color));border:1px solid var(--divider-color);border-radius:16px;padding:18px;min-width:0}.metric-label{color:var(--secondary-text-color);font-size:13px}.metric{font-size:clamp(26px,3vw,34px);font-weight:650;margin:8px 0 3px}.unit{font-size:15px;font-weight:450;color:var(--secondary-text-color)}.hint{color:var(--secondary-text-color);font-size:12px}.level{height:6px;border-radius:6px;background:var(--divider-color);margin-top:14px;overflow:hidden}.level i{display:block;height:100%;background:var(--accent-color,#03a9f4);border-radius:inherit}.status{margin:14px 0;padding:12px 14px;border-radius:12px;background:var(--secondary-background-color);font-size:13px}.warn{color:var(--warning-color,#e6a700)}.section{margin-top:18px}.section h2{font-size:18px;margin:0 0 4px}.section p{color:var(--secondary-text-color);margin:0 0 12px;font-size:13px}.charts{display:grid;grid-template-columns:1.35fr 1fr;gap:14px}.chart-card{background:var(--card-background-color,var(--secondary-background-color));border:1px solid var(--divider-color);border-radius:16px;padding:18px;min-width:0}.chart-card h3{margin:0;font-size:16px}.chart-card p{margin:5px 0 12px;color:var(--secondary-text-color);font-size:12px}svg{display:block;width:100%;height:auto;overflow:visible}.axis{stroke:var(--divider-color);stroke-width:1}.axis-label{fill:var(--secondary-text-color);font-size:11px}.oil-line{fill:none;stroke:var(--accent-color,#03a9f4);stroke-width:3}.temp-line{fill:none;stroke:var(--orange-color,#ff9800);stroke-width:2.4;stroke-dasharray:6 4}.oil-bar{fill:var(--accent-color,#03a9f4);opacity:.2}.temp-dot{fill:var(--orange-color,#ff9800)}.scatter-dot{fill:var(--accent-color,#03a9f4);opacity:.75}.trend-line{stroke:var(--orange-color,#ff9800);stroke-width:2;stroke-dasharray:5 4}.legend{display:flex;gap:16px;flex-wrap:wrap;font-size:12px;color:var(--secondary-text-color);margin-top:8px}.key{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:6px;background:var(--accent-color,#03a9f4)}.key.temp{background:var(--orange-color,#ff9800)}.toolbar{display:flex;align-items:center;gap:8px}.toolbar select,.toolbar button{color:var(--primary-text-color);background:var(--card-background-color,var(--secondary-background-color));border:1px solid var(--divider-color);border-radius:9px;padding:9px 11px;font:inherit}.empty{padding:24px 8px;color:var(--secondary-text-color);font-size:13px}.details{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.detail{padding:13px;background:var(--secondary-background-color);border-radius:12px}.detail b{display:block;font-size:18px;margin-top:5px}.foot{margin-top:16px;color:var(--secondary-text-color);font-size:12px;line-height:1.5}@media(max-width:850px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}.charts{grid-template-columns:1fr}}@media(max-width:520px){.page{padding:20px 14px 36px}.grid{gap:9px}.card{padding:14px}.metric{font-size:25px}.details{grid-template-columns:repeat(2,1fr)}.top{align-items:center}}
+        *{box-sizing:border-box}.page{max-width:1180px;margin:0 auto;padding:28px 24px 48px}.top{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;margin-bottom:22px}.eyebrow{color:var(--secondary-text-color);font-size:12px;letter-spacing:.11em;text-transform:uppercase}.title{font-size:clamp(28px,4vw,38px);font-weight:650;margin:5px 0}.subtitle{color:var(--secondary-text-color);margin:0}.grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}.card{background:var(--card-background-color,var(--secondary-background-color));border:1px solid var(--divider-color);border-radius:16px;padding:18px;min-width:0}.metric-label{color:var(--secondary-text-color);font-size:13px}.metric{font-size:clamp(26px,3vw,34px);font-weight:650;margin:8px 0 3px}.unit{font-size:15px;font-weight:450;color:var(--secondary-text-color)}.hint{color:var(--secondary-text-color);font-size:12px}.level{height:6px;border-radius:6px;background:var(--divider-color);margin-top:14px;overflow:hidden}.level i{display:block;height:100%;background:var(--accent-color,#03a9f4);border-radius:inherit}.status{margin:14px 0;padding:12px 14px;border-radius:12px;background:var(--secondary-background-color);font-size:13px}.warn{color:var(--warning-color,#e6a700)}.section{margin-top:18px}.section h2{font-size:18px;margin:0 0 4px}.section p{color:var(--secondary-text-color);margin:0 0 12px;font-size:13px}.charts{display:grid;grid-template-columns:1.35fr 1fr;gap:14px}.chart-card{background:var(--card-background-color,var(--secondary-background-color));border:1px solid var(--divider-color);border-radius:16px;padding:18px;min-width:0}.chart-card h3{margin:0;font-size:16px}.chart-card p{margin:5px 0 12px;color:var(--secondary-text-color);font-size:12px}svg{display:block;width:100%;height:auto;overflow:visible}.axis{stroke:var(--divider-color);stroke-width:1}.axis-label{fill:var(--secondary-text-color);font-size:11px}.oil-line{fill:none;stroke:var(--accent-color,#03a9f4);stroke-width:3}.temp-line{fill:none;stroke:var(--orange-color,#ff9800);stroke-width:2.4;stroke-dasharray:6 4}.oil-bar{fill:var(--accent-color,#03a9f4);opacity:.2}.temp-dot{fill:var(--orange-color,#ff9800)}.scatter-dot{fill:var(--accent-color,#03a9f4);opacity:.75}.trend-line{fill:none;stroke:var(--orange-color,#ff9800);stroke-width:2;stroke-dasharray:5 4}.knee-line{stroke:var(--divider-color);stroke-width:1;stroke-dasharray:2 3}.legend{display:flex;gap:16px;flex-wrap:wrap;font-size:12px;color:var(--secondary-text-color);margin-top:8px}.key{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:6px;background:var(--accent-color,#03a9f4)}.key.temp{background:var(--orange-color,#ff9800)}.toolbar{display:flex;align-items:center;gap:8px}.toolbar select,.toolbar button{color:var(--primary-text-color);background:var(--card-background-color,var(--secondary-background-color));border:1px solid var(--divider-color);border-radius:9px;padding:9px 11px;font:inherit}.empty{padding:24px 8px;color:var(--secondary-text-color);font-size:13px}.details{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.detail{padding:13px;background:var(--secondary-background-color);border-radius:12px}.detail b{display:block;font-size:18px;margin-top:5px}.foot{margin-top:16px;color:var(--secondary-text-color);font-size:12px;line-height:1.5}@media(max-width:850px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}.charts{grid-template-columns:1fr}}@media(max-width:520px){.page{padding:20px 14px 36px}.grid{gap:9px}.card{padding:14px}.metric{font-size:25px}.details{grid-template-columns:repeat(2,1fr)}.top{align-items:center}}
       </style>
       <main class="page">
         <header class="top"><div><div class="eyebrow">Home energy · heating oil</div><h1 class="title">Oil Monitor</h1><p class="subtitle">Your tank, usage trends and weather-aware outlook</p></div><div class="toolbar"><select aria-label="History range"><option value="30" ${this._rangeDays === 30 ? "selected" : ""}>30 days</option><option value="90" ${this._rangeDays === 90 ? "selected" : ""}>90 days</option><option value="365" ${this._rangeDays === 365 ? "selected" : ""}>1 year</option></select><button type="button" class="refresh" title="Refresh history">↻</button></div></header>
@@ -411,7 +439,7 @@ class OilMonitorPanel extends HTMLElement {
         <div class="status ${stale ? "warn" : ""}">${status}${this._loading ? " Loading recorder history…" : ""}${this._error ? ` History: ${this._escape(this._error)}` : ""}</div>
         <section class="section"><h2>Usage and weather over time</h2><p>Weekly tank-level changes are converted with your tank calibration and compared with weekly outdoor temperatures. Refill and suspect weeks are excluded.</p><div class="charts">
           <article class="chart-card"><h3>Weekly oil use & outdoor temperature</h3><p>Bars and blue line: litres used · orange: mean outdoor temperature</p>${this._chart(weeks)}<div class="legend"><span><i class="key"></i>Oil use (L/week)</span><span><i class="key temp"></i>Outdoor temperature</span></div></article>
-          <article class="chart-card"><h3>Oil use vs outdoor temperature</h3><p>Each point is a clean week. Dashed line shows a simple trend, not a guarantee.</p>${this._scatter(weeks)}</article>
+          <article class="chart-card"><h3>Oil use vs outdoor temperature</h3><p>Each point is a clean week. The dashed curve flattens to hot-water-only use above the temperature where heating switches off.</p>${this._scatter(weeks)}</article>
         </div></section>
         <section class="section"><h2>Home heating conditions</h2><p>Live context from your selected Home Assistant entities.</p><div class="details"><div class="detail"><span class="metric-label">Indoor temperature</span><b>${this._format(indoor?.state, 1)} ${indoor?.attributes?.unit_of_measurement || "°C"}</b></div><div class="detail"><span class="metric-label">Thermostat target</span><b>${this._format(targetValue, 1)} ${targetUnit}</b></div><div class="detail"><span class="metric-label">Heating runtime today</span><b>${runtimeValue}</b></div><div class="detail"><span class="metric-label">History range</span><b>${this._rangeDays} days</b></div></div></section>
         <p class="foot">Forecasts are estimates learned from available tank, temperature and heating history. A limited or noisy history can make the range wide or misleading. Use this as a planning aid, not as the only basis for ordering oil.<br>Dashboard build ${this._escape(config.build || "unknown")}</p>

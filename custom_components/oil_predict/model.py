@@ -183,6 +183,9 @@ class UsageModel:
 
     runtime_intercept_hours: float
     runtime_hours_per_degree: float
+    # Heating only runs once it is this many degrees colder outside than
+    # indoors; above that (the switch-off point) only the intercept remains.
+    runtime_switch_off_gap_c: float
     oil_baseline_litres_per_day: float
     oil_litres_per_heating_hour: float
     runtime_rmse_hours: float
@@ -229,6 +232,45 @@ def _linear_fit(points: Sequence[tuple[float, float]]) -> tuple[float, float, fl
     return intercept, slope, rmse
 
 
+def _switch_off_fit(
+    points: Sequence[tuple[float, float]], step: float = 0.25, min_active: int = 3
+) -> tuple[float, float, float, float]:
+    """Fit y = intercept + slope*max(0, x - switch_off), with slope >= 0.
+
+    Heating demand is flat (zero, or hot water only) until the indoor/outdoor
+    gap exceeds a threshold, then rises linearly. The threshold is chosen by
+    grid search; ties prefer the smallest threshold. Returns intercept,
+    slope, threshold and residual RMSE.
+    """
+    if not points:
+        raise ValueError("At least one training point is required")
+
+    def fit_at(threshold: float) -> tuple[float, float, float]:
+        shifted = [(max(0.0, x - threshold), y) for x, y in points]
+        _, slope, _ = _linear_fit(shifted)
+        slope = max(0.0, slope)
+        intercept = max(
+            0.0, sum(y - slope * x for x, y in shifted) / len(shifted)
+        )
+        sse = sum((y - (intercept + slope * x)) ** 2 for x, y in shifted)
+        return intercept, slope, sse
+
+    best_threshold = 0.0
+    best = fit_at(0.0)
+    highest = max(x for x, _ in points)
+    threshold = step
+    while threshold < highest:
+        if sum(1 for x, _ in points if x > threshold) < min_active:
+            break
+        candidate = fit_at(threshold)
+        if candidate[2] < best[2] - 1e-9 * (1 + best[2]):
+            best, best_threshold = candidate, threshold
+        threshold += step
+
+    intercept, slope, sse = best
+    return intercept, slope, best_threshold, math.sqrt(sse / len(points))
+
+
 def fit_usage_model(samples: Sequence[DailyTrainingSample]) -> UsageModel:
     """Fit a two-stage model from cleaned daily tank, temperature, and runtime data.
 
@@ -256,25 +298,10 @@ def fit_usage_model(samples: Sequence[DailyTrainingSample]) -> UsageModel:
         (max(0.0, sample.indoor_mean_c - sample.outdoor_mean_c), sample.heating_hours)
         for sample in samples
     ]
-    runtime_intercept, runtime_slope, runtime_rmse = _linear_fit(runtime_points)
-
-    # Heating demand and runtime should not decrease as the indoor/outdoor
-    # temperature gap grows. Keep the learned model physically plausible.
-    runtime_slope = max(0.0, runtime_slope)
-    runtime_intercept = max(
-        0.0,
-        sum(
-            observed - runtime_slope * delta
-            for delta, observed in runtime_points
-        )
-        / len(runtime_points),
-    )
-    runtime_rmse = math.sqrt(
-        sum(
-            (observed - (runtime_intercept + runtime_slope * delta)) ** 2
-            for delta, observed in runtime_points
-        )
-        / len(runtime_points)
+    # Runtime never falls as the gap grows, and stops rising once the
+    # weather is warm enough for the heating to switch off.
+    runtime_intercept, runtime_slope, switch_off_gap, runtime_rmse = (
+        _switch_off_fit(runtime_points)
     )
 
     oil_points = [(sample.heating_hours, sample.litres_used) for sample in samples]
@@ -300,6 +327,7 @@ def fit_usage_model(samples: Sequence[DailyTrainingSample]) -> UsageModel:
     return UsageModel(
         runtime_intercept_hours=runtime_intercept,
         runtime_hours_per_degree=runtime_slope,
+        runtime_switch_off_gap_c=switch_off_gap,
         oil_baseline_litres_per_day=oil_baseline,
         oil_litres_per_heating_hour=oil_rate,
         runtime_rmse_hours=runtime_rmse,
@@ -327,7 +355,8 @@ def forecast_week(
         heating_hours = max(
             0.0,
             model.runtime_intercept_hours
-            + model.runtime_hours_per_degree * temperature_gap,
+            + model.runtime_hours_per_degree
+            * max(0.0, temperature_gap - model.runtime_switch_off_gap_c),
         )
         litres = max(
             0.0,

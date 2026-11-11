@@ -97,6 +97,35 @@ class TestUsageForecast(unittest.TestCase):
         self.assertTrue(all(day.predicted_litres > 0 for day in cold.days))
         self.assertEqual(len(cold.days), 7)
 
+    def test_fit_finds_heating_switch_off(self) -> None:
+        """Warm weeks use only hot water; the fit finds where heating stops."""
+        samples = []
+        for index in range(30):
+            outdoor = -2.0 + index * 0.75  # -2 to about 20 degrees
+            indoor = 20.0
+            gap = max(0.0, indoor - outdoor)
+            heating_hours = 0.6 * max(0.0, gap - 5.0)  # off above 15 degrees
+            samples.append(
+                DailyTrainingSample(
+                    outdoor_mean_c=outdoor,
+                    indoor_mean_c=indoor,
+                    heating_hours=heating_hours,
+                    litres_used=1.2 + 1.5 * heating_hours,
+                )
+            )
+        model = fit_usage_model(samples)
+        self.assertAlmostEqual(model.runtime_switch_off_gap_c, 5.0)
+        self.assertAlmostEqual(model.runtime_hours_per_degree, 0.6)
+        self.assertAlmostEqual(model.runtime_intercept_hours, 0.0, places=6)
+
+        warm = forecast_week(model, [17.0] * 7, indoor_target_c=20.0)
+        warmer = forecast_week(model, [22.0] * 7, indoor_target_c=20.0)
+        # Above the switch-off temperature only hot-water use remains.
+        self.assertAlmostEqual(warm.total_litres, 1.2 * 7, places=4)
+        self.assertAlmostEqual(warmer.total_litres, warm.total_litres, places=6)
+        cold = forecast_week(model, [5.0] * 7, indoor_target_c=20.0)
+        self.assertAlmostEqual(cold.total_litres, 7 * (1.2 + 1.5 * 0.6 * 10), places=4)
+
     def test_rejects_insufficient_training_history(self) -> None:
         """Do not fit a personalized model from too few noisy daily samples."""
         with self.assertRaisesRegex(ValueError, "14 clean samples"):
