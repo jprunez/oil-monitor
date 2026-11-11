@@ -1,11 +1,21 @@
 """Pure calculations used by the Oil Monitor integration."""
 
-from dataclasses import dataclass
-import math
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
+import math
 
-# Depth in centimetres mapped to percentage full, based on the tank calibration.
+# What kind of value the tank sensor reports.
+LEVEL_DISTANCE = "distance"  # cm from the sensor down to the oil surface
+LEVEL_PERCENT = "percent"  # percent full
+LEVEL_LITRES = "litres"  # litres in the tank
+
+# How a distance reading is turned into a volume.
+SHAPE_VERTICAL = "vertical"  # upright cylinder or box: volume follows height
+SHAPE_HORIZONTAL_CYLINDER = "horizontal_cylinder"
+SHAPE_CUSTOM = "custom"  # a measured distance-to-percent table
+
+# The original prototype tank: distance in cm mapped to percent full.
 DEPTH_TO_PERCENT: tuple[tuple[float, float], ...] = (
     (9.0, 100.0),
     (17.0, 90.0),
@@ -19,6 +29,64 @@ DEPTH_TO_PERCENT: tuple[tuple[float, float], ...] = (
     (113.0, 10.0),
     (126.0, 0.0),
 )
+
+# Training-data limits, as fractions of tank capacity so they suit any tank.
+REFILL_RISE_FRACTION = 0.05  # a day-to-day rise above this is a refill
+MAX_WEEKLY_USE_FRACTION = 0.30  # more use than this in a week is a sensor fault
+
+# Weeks of clean history needed for an estimate, and for full confidence.
+MIN_TRAINING_WEEKS = 6
+FULL_CONFIDENCE_WEEKS = 14
+
+
+@dataclass(frozen=True)
+class TankConfig:
+    """How to turn a tank sensor reading into litres."""
+
+    capacity_litres: float
+    level_type: str = LEVEL_DISTANCE
+    shape: str = SHAPE_CUSTOM
+    full_distance_cm: float = DEPTH_TO_PERCENT[0][0]
+    empty_distance_cm: float = DEPTH_TO_PERCENT[-1][0]
+    calibration: tuple[tuple[float, float], ...] = DEPTH_TO_PERCENT
+
+
+def parse_calibration(text: str) -> tuple[tuple[float, float], ...]:
+    """Parse "distance:percent" pairs such as "9:100, 66:50, 126:0".
+
+    Pairs may be separated by commas, semicolons or new lines. Returns the
+    pairs sorted by distance. Raises ValueError when the table is unusable.
+    """
+    pairs: list[tuple[float, float]] = []
+    for chunk in text.replace(";", ",").replace("\n", ",").split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        if ":" not in chunk:
+            raise ValueError(f"'{chunk}' is not in distance:percent form")
+        distance_text, percent_text = chunk.split(":", 1)
+        distance = float(distance_text)
+        percent = float(percent_text)
+        if not (math.isfinite(distance) and distance > 0):
+            raise ValueError("Distances must be positive numbers")
+        if not (math.isfinite(percent) and 0 <= percent <= 100):
+            raise ValueError("Percentages must be between 0 and 100")
+        pairs.append((distance, percent))
+    pairs.sort()
+    if len(pairs) < 2:
+        raise ValueError("At least two calibration points are needed")
+    if len({distance for distance, _ in pairs}) != len(pairs):
+        raise ValueError("Each distance may appear only once")
+    return tuple(pairs)
+
+
+def format_calibration(pairs: Sequence[tuple[float, float]]) -> str:
+    """Format calibration pairs as text that ``parse_calibration`` accepts."""
+    return ", ".join(f"{_short(distance)}:{_short(percent)}" for distance, percent in pairs)
+
+
+def _short(value: float) -> str:
+    return str(int(value)) if float(value).is_integer() else str(value)
 
 
 def parse_sample_timestamp(value: str) -> datetime | None:
@@ -39,44 +107,88 @@ def parse_sample_timestamp(value: str) -> datetime | None:
 
     try:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, AttributeError):
         return None
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
 
 
+def _interpolate_table(
+    distance_cm: float, table: Sequence[tuple[float, float]]
+) -> float:
+    """Percent full for a distance, interpolating a sorted distance table."""
+    if distance_cm <= table[0][0]:
+        return table[0][1]
+    if distance_cm >= table[-1][0]:
+        return table[-1][1]
+    for (low_distance, low_percent), (high_distance, high_percent) in zip(
+        table, table[1:]
+    ):
+        if low_distance <= distance_cm <= high_distance:
+            fraction = (distance_cm - low_distance) / (high_distance - low_distance)
+            return low_percent + fraction * (high_percent - low_percent)
+    return table[-1][1]
+
+
+def horizontal_cylinder_fraction(height_fraction: float) -> float:
+    """Volume fraction of a horizontal cylinder filled to ``height_fraction``."""
+    h = min(1.0, max(0.0, height_fraction))
+    angle = 2 * math.acos(1 - 2 * h)
+    return (angle - math.sin(angle)) / (2 * math.pi)
+
+
+def reading_to_litres(value: float, tank: TankConfig) -> float:
+    """Convert a tank sensor reading to litres according to ``tank``."""
+    if not math.isfinite(tank.capacity_litres) or tank.capacity_litres <= 0:
+        raise ValueError("Tank capacity must be a finite positive number")
+    if not math.isfinite(value):
+        raise ValueError("Tank reading must be a finite number")
+
+    if tank.level_type == LEVEL_LITRES:
+        if value < 0:
+            raise ValueError("Litres cannot be negative")
+        return value
+
+    if tank.level_type == LEVEL_PERCENT:
+        if value < 0 or value > 110:
+            raise ValueError("Percent full must be between 0 and 100")
+        return tank.capacity_litres * min(100.0, value) / 100.0
+
+    # Distance from the sensor down to the oil surface.
+    if value <= 0:
+        raise ValueError("Tank distance must be a positive number")
+    if tank.shape == SHAPE_CUSTOM:
+        percent_full = _interpolate_table(value, tank.calibration)
+    else:
+        span = tank.empty_distance_cm - tank.full_distance_cm
+        if span <= 0:
+            raise ValueError("The empty distance must be greater than the full distance")
+        height_fraction = min(1.0, max(0.0, (tank.empty_distance_cm - value) / span))
+        if tank.shape == SHAPE_HORIZONTAL_CYLINDER:
+            percent_full = 100.0 * horizontal_cylinder_fraction(height_fraction)
+        else:
+            percent_full = 100.0 * height_fraction
+    return tank.capacity_litres * percent_full / 100.0
+
+
 def depth_to_litres(depth_cm: float, tank_capacity_litres: float) -> float:
-    """Convert a valid tank depth to litres using linear interpolation."""
+    """Convert a distance reading with the prototype tank's calibration table."""
     if not math.isfinite(depth_cm) or depth_cm <= 0:
         raise ValueError("Tank depth must be a finite positive number")
-    if not math.isfinite(tank_capacity_litres) or tank_capacity_litres <= 0:
-        raise ValueError("Tank capacity must be a finite positive number")
-
-    if depth_cm <= DEPTH_TO_PERCENT[0][0]:
-        percent_full = DEPTH_TO_PERCENT[0][1]
-    elif depth_cm >= DEPTH_TO_PERCENT[-1][0]:
-        percent_full = DEPTH_TO_PERCENT[-1][1]
-    else:
-        percent_full = 0.0
-        for (low_depth, low_percent), (high_depth, high_percent) in zip(
-            DEPTH_TO_PERCENT, DEPTH_TO_PERCENT[1:]
-        ):
-            if low_depth <= depth_cm <= high_depth:
-                fraction = (depth_cm - low_depth) / (high_depth - low_depth)
-                percent_full = low_percent + fraction * (high_percent - low_percent)
-                break
-
-    return tank_capacity_litres * percent_full / 100.0
+    return reading_to_litres(depth_cm, TankConfig(capacity_litres=tank_capacity_litres))
 
 
 @dataclass(frozen=True)
 class DailyTrainingSample:
-    """One clean day of measured oil use and heating conditions."""
+    """One clean (average) day of measured oil use and heating conditions.
+
+    ``heating_hours`` is None when no heating-runtime sensor is configured.
+    """
 
     outdoor_mean_c: float
     indoor_mean_c: float
-    heating_hours: float
+    heating_hours: float | None
     litres_used: float
 
 
@@ -85,10 +197,10 @@ class DailyHistoryPoint:
     """One day's recorder statistics used to build weekly training samples."""
 
     day: date
-    depth_mean_cm: float
+    litres_mean: float
     outdoor_mean_c: float
     indoor_mean_c: float
-    runtime_max_hours: float
+    runtime_max_hours: float | None = None
 
 
 def build_training_samples(
@@ -98,7 +210,8 @@ def build_training_samples(
 
     Each sample represents the average day in one complete Monday-to-Sunday
     week. Tank-volume differences are calculated across the full week, reducing
-    the impact of the ultrasonic sensor's one-centimetre quantisation.
+    the impact of sensor quantisation. Weeks with a refill, a missing day or an
+    implausible amount of use are skipped.
     """
     by_day = {point.day: point for point in points}
     if len(by_day) != len(points):
@@ -109,6 +222,8 @@ def build_training_samples(
     if not by_day:
         return []
 
+    refill_rise = REFILL_RISE_FRACTION * tank_capacity_litres
+    max_weekly_use = MAX_WEEKLY_USE_FRACTION * tank_capacity_litres
     first_day = min(by_day)
     last_day = max(by_day)
     monday = first_day - timedelta(days=first_day.weekday())
@@ -126,50 +241,42 @@ def build_training_samples(
         interval = [previous_sunday, *complete_week]
         numeric_values = [
             value
-            for point in complete_week
-            for value in (
-                previous_sunday.depth_mean_cm,
-                point.depth_mean_cm,
-                point.outdoor_mean_c,
-                point.indoor_mean_c,
-                point.runtime_max_hours,
-            )
+            for point in interval
+            for value in (point.litres_mean, point.outdoor_mean_c, point.indoor_mean_c)
         ]
         if not all(math.isfinite(value) for value in numeric_values):
             continue
-        if any(
-            point.depth_mean_cm <= 0
-            or point.runtime_max_hours < 0
-            for point in interval
+        if any(point.litres_mean < 0 for point in interval):
+            continue
+
+        runtimes = [point.runtime_max_hours for point in complete_week]
+        has_runtime = all(runtime is not None for runtime in runtimes)
+        if has_runtime and not all(
+            math.isfinite(runtime) and runtime >= 0 for runtime in runtimes
         ):
             continue
 
-        # A refill makes the apparent tank-level change positive. Skip that
-        # week rather than treating a refill as negative consumption.
-        depth_changes = [
-            current.depth_mean_cm - previous.depth_mean_cm
+        # A refill makes the tank level rise. Skip that week rather than
+        # treating a refill as negative consumption.
+        if any(
+            current.litres_mean - previous.litres_mean > refill_rise
             for previous, current in zip(interval, interval[1:])
-        ]
-        if any(change <= -8.0 for change in depth_changes):
+        ):
             continue
 
-        start_litres = depth_to_litres(
-            previous_sunday.depth_mean_cm, tank_capacity_litres
-        )
-        end_litres = depth_to_litres(
-            complete_week[-1].depth_mean_cm, tank_capacity_litres
-        )
-        weekly_usage = start_litres - end_litres
+        weekly_usage = previous_sunday.litres_mean - complete_week[-1].litres_mean
         # Reject implausibly large weekly changes, likely caused by a sensor
         # jump rather than normal consumption.
-        if weekly_usage < 0 or weekly_usage > 300:
+        if weekly_usage < 0 or weekly_usage > max_weekly_use:
             continue
 
         samples.append(
             DailyTrainingSample(
                 outdoor_mean_c=sum(p.outdoor_mean_c for p in complete_week) / 7,
                 indoor_mean_c=sum(p.indoor_mean_c for p in complete_week) / 7,
-                heating_hours=sum(p.runtime_max_hours for p in complete_week) / 7,
+                heating_hours=(
+                    sum(runtimes) / 7 if has_runtime else None  # type: ignore[arg-type]
+                ),
                 litres_used=weekly_usage / 7,
             )
         )
@@ -179,7 +286,12 @@ def build_training_samples(
 
 @dataclass(frozen=True)
 class UsageModel:
-    """Learned relationship between indoor/outdoor delta, runtime, and oil use."""
+    """Learned relationship between indoor/outdoor gap, heating and oil use.
+
+    With a runtime sensor the model has two stages (gap -> heating hours ->
+    litres). Without one, "heating hours" are replaced by degrees of gap above
+    the switch-off point (slope 1, intercept 0), so the same equations apply.
+    """
 
     runtime_intercept_hours: float
     runtime_hours_per_degree: float
@@ -191,6 +303,12 @@ class UsageModel:
     runtime_rmse_hours: float
     oil_rmse_litres: float
     sample_count: int
+    uses_runtime: bool = True
+
+    @property
+    def is_early(self) -> bool:
+        """True while there is less history than needed for full confidence."""
+        return self.sample_count < FULL_CONFIDENCE_WEEKS
 
 
 @dataclass(frozen=True)
@@ -210,6 +328,7 @@ class WeeklyForecast:
     total_litres: float
     lower_litres: float
     upper_litres: float
+    early: bool = False
 
 
 def _linear_fit(points: Sequence[tuple[float, float]]) -> tuple[float, float, float]:
@@ -272,52 +391,65 @@ def _switch_off_fit(
 
 
 def fit_usage_model(samples: Sequence[DailyTrainingSample]) -> UsageModel:
-    """Fit a two-stage model from cleaned daily tank, temperature, and runtime data.
+    """Fit the usage model from cleaned daily-average samples.
 
     Refill weeks, invalid measurements, and periods without a reliable tank
-    delta must be removed before calling this function. Fourteen samples are
-    the minimum; the Home Assistant pipeline supplies weekly averages, so this
-    corresponds to fourteen weeks of history.
+    delta must be removed before calling this function. The Home Assistant
+    pipeline supplies one sample per clean week, so ``MIN_TRAINING_WEEKS``
+    samples correspond to that many weeks of history.
     """
-    if len(samples) < 14:
-        raise ValueError("At least 14 clean samples are required")
+    if len(samples) < MIN_TRAINING_WEEKS:
+        raise ValueError(f"At least {MIN_TRAINING_WEEKS} clean samples are required")
 
     for sample in samples:
-        values = (
-            sample.outdoor_mean_c,
-            sample.indoor_mean_c,
-            sample.heating_hours,
-            sample.litres_used,
-        )
+        values = [sample.outdoor_mean_c, sample.indoor_mean_c, sample.litres_used]
+        if sample.heating_hours is not None:
+            values.append(sample.heating_hours)
         if not all(math.isfinite(value) for value in values):
             raise ValueError("Training values must be finite numbers")
-        if sample.heating_hours < 0 or sample.litres_used < 0:
+        if (sample.heating_hours or 0) < 0 or sample.litres_used < 0:
             raise ValueError("Heating hours and oil use cannot be negative")
 
-    runtime_points = [
-        (max(0.0, sample.indoor_mean_c - sample.outdoor_mean_c), sample.heating_hours)
-        for sample in samples
-    ]
+    gaps = [max(0.0, s.indoor_mean_c - s.outdoor_mean_c) for s in samples]
+    uses_runtime = all(sample.heating_hours is not None for sample in samples)
+
+    if not uses_runtime:
+        # Oil use directly from the temperature gap, with a switch-off point.
+        baseline, rate, switch_off_gap, oil_rmse = _switch_off_fit(
+            [(gap, sample.litres_used) for gap, sample in zip(gaps, samples)]
+        )
+        return UsageModel(
+            runtime_intercept_hours=0.0,
+            runtime_hours_per_degree=1.0,
+            runtime_switch_off_gap_c=switch_off_gap,
+            oil_baseline_litres_per_day=baseline,
+            oil_litres_per_heating_hour=rate,
+            runtime_rmse_hours=0.0,
+            oil_rmse_litres=oil_rmse,
+            sample_count=len(samples),
+            uses_runtime=False,
+        )
+
     # Runtime never falls as the gap grows, and stops rising once the
     # weather is warm enough for the heating to switch off.
-    runtime_intercept, runtime_slope, switch_off_gap, runtime_rmse = (
-        _switch_off_fit(runtime_points)
+    runtime_intercept, runtime_slope, switch_off_gap, runtime_rmse = _switch_off_fit(
+        [(gap, sample.heating_hours) for gap, sample in zip(gaps, samples)]  # type: ignore[misc]
     )
 
     oil_points = [(sample.heating_hours, sample.litres_used) for sample in samples]
-    oil_baseline, oil_rate, _ = _linear_fit(oil_points)
+    oil_baseline, oil_rate, _ = _linear_fit(oil_points)  # type: ignore[arg-type]
     oil_rate = max(0.0, oil_rate)
     oil_baseline = max(
         0.0,
         sum(
-            sample.litres_used - oil_rate * sample.heating_hours
+            sample.litres_used - oil_rate * sample.heating_hours  # type: ignore[operator]
             for sample in samples
         )
         / len(samples),
     )
     oil_rmse = math.sqrt(
         sum(
-            (sample.litres_used - (oil_baseline + oil_rate * sample.heating_hours))
+            (sample.litres_used - (oil_baseline + oil_rate * sample.heating_hours))  # type: ignore[operator]
             ** 2
             for sample in samples
         )
@@ -333,6 +465,7 @@ def fit_usage_model(samples: Sequence[DailyTrainingSample]) -> UsageModel:
         runtime_rmse_hours=runtime_rmse,
         oil_rmse_litres=oil_rmse,
         sample_count=len(samples),
+        uses_runtime=True,
     )
 
 
@@ -385,11 +518,15 @@ def forecast_week(
         + (model.oil_litres_per_heating_hour * model.runtime_rmse_hours) ** 2
     )
     uncertainty = 1.96 * daily_error * math.sqrt(len(days))
+    if model.is_early:
+        # Few weeks of history understate the error; widen the range.
+        uncertainty *= math.sqrt(FULL_CONFIDENCE_WEEKS / model.sample_count)
     return WeeklyForecast(
         days=tuple(days),
         total_litres=total,
         lower_litres=max(0.0, total - uncertainty),
         upper_litres=total + uncertainty,
+        early=model.is_early,
     )
 
 

@@ -64,7 +64,8 @@ class OilLitresRemainingSensor(
         """Expose the depth and the sensor's own sample time for troubleshooting."""
         data = self.coordinator.data
         return {
-            "depth_cm": data["depth_cm"],
+            "sensor_reading": data["level_reading"],
+            "sensor_unit": data["level_unit"],
             "sample_time": data["sample_time"],
             "reading_age_minutes": data["age_minutes"],
         }
@@ -101,6 +102,8 @@ class WeeklyOilUsageSensor(CoordinatorEntity[OilPredictCoordinator], SensorEntit
         return {
             "temperature_offset_c": data["temperature_offset_c"],
             "indoor_target_source": data["indoor_target_source"],
+            "early_estimate": data["early_estimate"],
+            "training_weeks": data["training_weeks"],
         }
 
     @property

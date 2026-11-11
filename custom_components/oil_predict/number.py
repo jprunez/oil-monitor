@@ -6,7 +6,7 @@ from homeassistant.const import EntityCategory, UnitOfTemperature
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import CONF_TANK_CAPACITY, EMPTY_LITRES, REORDER_LITRES
+from .const import EMPTY_FRACTION, REORDER_FRACTION
 from .coordinator import OilPredictCoordinator
 
 
@@ -86,9 +86,10 @@ class TankLevelNumber(RestoreNumber):
         self._attr_icon = "mdi:cart-arrow-down" if level == "reorder" else "mdi:gauge-empty"
         self._attr_unique_id = f"{entry.entry_id}_{level}_level"
         self._attr_device_info = coordinator.device_info
-        self._attr_native_max_value = float(entry.data[CONF_TANK_CAPACITY])
+        capacity = coordinator.tank.capacity_litres
+        self._attr_native_max_value = float(capacity)
         self._attr_native_value = float(
-            REORDER_LITRES if level == "reorder" else EMPTY_LITRES
+            round(capacity * (REORDER_FRACTION if level == "reorder" else EMPTY_FRACTION))
         )
 
     async def async_added_to_hass(self) -> None:

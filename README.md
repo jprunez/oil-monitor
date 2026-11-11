@@ -1,43 +1,92 @@
 # Oil Monitor for Home Assistant
 
-Oil Monitor is a custom Home Assistant integration that estimates heating-oil tank volume and projects usage from tank, weather, indoor-temperature, and heating-runtime sensors. It adds a sidebar dashboard; users do not need to create Lovelace cards.
+Oil Monitor tells you how much heating oil is in your tank, how much you are likely to use in the coming week, and roughly when you will need to order more. It learns from your own tank, temperature and heating history and uses the weather forecast. It adds an **Oil Monitor** page to the Home Assistant sidebar, so you don't need to build any dashboard cards.
 
-## Features
+> This is an experimental project. Estimates are a planning aid, not a guarantee. Keep checking your tank and order oil in good time.
 
-- Estimated litres remaining from an ultrasonic tank-depth sensor.
-- A warning when the tank reading is stale.
-- A seven-day usage estimate with a lower and upper estimate, when enough history and a supported weather forecast are available.
-- How long the oil will last: days until the reorder level and until empty, with dates. The first week uses the weather forecast and later weeks use last year's temperatures for the same dates. The reorder (default 250 L) and empty (default 50 L) levels can be changed on the Oil Monitor device page.
-- A dashboard with tank status and historical oil-use versus outdoor-temperature charts.
+## What you get
 
-This is an experimental project. Predictions are estimates, not a guarantee or a substitute for checking the tank and arranging fuel delivery.
+- **Litres remaining**, from a distance, percent or litres sensor on your tank.
+- **A warning when the tank reading is out of date**, for example when the sensor's battery is flat.
+- **Estimated oil use for the next 7 days**, with a likely range, based on the weather forecast.
+- **How long the oil will last**: days until your reorder level and until empty, with dates and a projected-level chart. The first week follows the weather forecast. Later weeks assume temperatures like the same time last year.
+- **History charts** of weekly oil use against outdoor temperature, including the temperature at which your heating switches off.
+- **Settings on the dashboard** for the reorder level, the empty level and a "what if it were warmer or cooler indoors" adjustment.
 
-## Important calibration note
+## What you need
 
-The included depth-to-level calibration curve is a prototype for one particular tank. The setup lets you set tank capacity, but it does not yet let you enter a different tank-shape calibration curve. On a differently shaped tank, displayed litres and usage estimates may be inaccurate even if the capacity is correct.
+| | Required? | Notes |
+|---|---|---|
+| A sensor on the oil tank | Yes | Reports one of: **distance** from the sensor down to the oil (e.g. an ultrasonic sensor), **percent full**, or **litres**. |
+| Outdoor temperature sensor | Yes | °C or °F. |
+| Indoor temperature sensor | Yes | A room or thermostat temperature. |
+| Thermostat | Yes | Your thermostat (climate entity) or a sensor holding its target temperature. |
+| Weather forecast | Yes | A weather entity with 7 daily forecasts (most weather integrations provide this). |
+| Daily heating runtime sensor | Optional | Hours the heating has run today, resetting each day. Makes estimates more accurate. |
+| Tank measurement time sensor | Optional | When the tank sensor actually took its reading. Useful for radio/MQTT sensors that resend old readings. |
 
-## Install on Home Assistant OS
+**Important:** the tank, outdoor and indoor sensors (and the runtime sensor if you use one) must keep **long-term statistics**. That means they need a *state class* of `measurement`. You can check under **Developer tools → Statistics**: each sensor should be listed there. Without statistics there is no history, so no charts or estimates.
 
-These steps use the Home Assistant **File editor** add-on. You need access to this GitHub repository to download its files.
+Estimates start once there are about **6 complete, clean weeks** of history. A clean week has data for every day and no oil delivery. Until about 14 weeks they are marked as early estimates, with a wider range. If your sensors have already been recording, this history is used straight away.
 
-1. Make a full Home Assistant backup from **Settings → System → Backups**.
-2. On your computer, open this GitHub repository. Select **Code → Download ZIP**, then extract the ZIP file.
-3. In the extracted project, open `custom_components`, then `oil_predict`.
-4. In Home Assistant, open **Settings → Add-ons → File editor → Open Web UI**. Browse to `/config`. Create a `custom_components` folder if it is missing, then create and open `/config/custom_components/oil_predict`.
-5. Upload the files from the extracted `oil_predict` folder into `/config/custom_components/oil_predict`. Inside that folder, also create `translations` and upload `translations/en.json` there. Create `www` and upload `www/oil-monitor-panel.js` there. Do not upload the whole ZIP or the whole project folder.
-6. Restart Home Assistant from **Settings → System → Restart**.
-7. If the integration is not already set up, go to **Settings → Devices & services → Add integration**, search for **Oil Monitor**, and select the matching tank depth, measurement timestamp, indoor/outdoor temperature, daily heating-runtime, thermostat-target, and weather-forecast sensors from your own Home Assistant.
-8. Enter your tank's usable capacity. The default is 1000 L; change it if that is not correct. The default stale-reading timeout is 90 minutes.
-9. Open **Oil Monitor** from the Home Assistant sidebar.
+## Install
 
-The measurement timestamp sensor is used for freshness checks because retained MQTT messages can make `last_updated` look newer than the actual tank measurement. The usage estimate needs at least 14 clean weeks of daily long-term statistics and a weather entity that provides seven daily forecasts.
+1. Make sure you have [HACS](https://hacs.xyz) installed.
+2. In Home Assistant, open **HACS**, select the **⋮** menu (top right), then **Custom repositories**.
+3. Enter `https://github.com/jprunez/oil-monitor`, choose **Integration** as the type, and select **Add**.
+4. Find **Oil Monitor** in HACS, select **Download**, then restart Home Assistant.
+5. Go to **Settings → Devices & services → Add integration** and search for **Oil Monitor**.
 
-## HACS
+New versions appear as an update notice in Home Assistant. If an update causes problems, **HACS → Oil Monitor → ⋮ → Redownload** lets you go back to an earlier version.
 
-Oil Monitor can be installed as a HACS custom repository. Updates are published as GitHub releases, so Home Assistant shows an "update available" notice when a new version is out, and HACS **Redownload** can roll back to an earlier version.
+## Setup
 
-## Publishing a release (maintainers)
+Setup takes three short steps.
 
-1. Bump `version` in `custom_components/oil_predict/manifest.json`, for example to `0.1.8`, and commit it to `main`.
-2. Tag that commit with the same version and push the tag: `git tag v0.1.8 && git push origin v0.1.8`.
-3. The **Release** GitHub Action checks that the tag matches `manifest.json`, runs the tests, and publishes the release with generated notes.
+### 1. Oil tank
+Choose your tank sensor, what it reports (distance, percent or litres) and the tank's usable capacity in litres.
+
+### 2. Tank shape (distance sensors only)
+A distance sensor measures the gap between the sensor and the oil surface. Oil Monitor needs to know how that gap relates to litres:
+
+- **Distance when full:** the sensor-to-oil distance with a full tank.
+- **Distance when empty:** the sensor-to-oil distance at the bottom of the tank, or at the outlet if oil below it can't be used.
+- **Shape:**
+  - **Upright cylinder or box:** straight sides, so the volume follows the oil height. Most plastic tanks are close to this.
+  - **Horizontal cylinder:** a round tank lying on its side. The middle holds more oil per centimetre than the top or bottom, and this is allowed for.
+  - **Custom calibration table:** if you have measured your own tank, enter `distance:percent` pairs, e.g. `10:100, 40:70, 75:35, 110:0`. They don't need to be in order.
+
+**Percent sensors:** a ready-made gauge's percentage is only as accurate as the gauge's own tank settings. Many simple gauges report percent of *height*, which is wrong for horizontal round tanks. If yours does that, set it to report distance instead and choose the shape here.
+
+### 3. Temperatures and weather
+Choose the temperature sensors, thermostat and weather forecast, and optionally the runtime and measurement-time sensors. Set **Warn when the tank reading is older than** a little longer than your sensor's normal reporting interval.
+
+### Changing settings later
+Go to **Settings → Devices & services → Oil Monitor → Configure**. The reorder level, empty level and temperature adjustment are also on the Oil Monitor dashboard under **Settings**.
+
+## Sensors created
+
+| Entity | What it is |
+|---|---|
+| Litres remaining | Current litres, with the raw sensor reading as an attribute. |
+| Tank sensor stale | On when the reading is missing or older than your limit. Its attributes show how many clean weeks of history there are. |
+| Estimated oil use next 7 days, lower and upper estimate | The 7-day estimate and its range. |
+| Days until reorder level, Days until empty | How long the oil will last, with `date` and `earliest_date` attributes. Useful for automations, e.g. a phone notification when reorder is under 7 days away. |
+| Reorder level, Empty level, Forecast temperature adjustment | Settings (also on the dashboard). Reorder defaults to 25 % of capacity, empty to 5 %. |
+
+## Troubleshooting
+
+- **No charts, or "No long-term statistics found":** the tank or outdoor sensor isn't keeping statistics. Give it `state_class: measurement`, for example through its integration's settings or a template sensor. Then wait for history to build up.
+- **Estimated use stays blank:** the grey text under it gives the reason. Usually it needs more clean weeks of history, or the weather entity doesn't provide 7 daily forecasts.
+- **Litres look wrong:** check the sensor type, capacity and full/empty distances under **Configure**. If the tank shape isn't upright or a horizontal cylinder, use a custom table.
+- **Dashboard looks out of date after an update:** restart Home Assistant, then close and reopen the browser tab. The footer shows the running version.
+
+## Development
+
+- Model tests: `python -m unittest discover -s tests`
+- Home Assistant integration tests: `pip install pytest-homeassistant-custom-component`, then `python -m pytest`. These run automatically on GitHub for every push.
+
+### Publishing a release
+1. Bump `version` in `custom_components/oil_predict/manifest.json`, for example to `0.4.1`, and commit it to `main`.
+2. Tag that commit with the same version and push the tag: `git tag v0.4.1 && git push origin v0.4.1`.
+3. The **Release** GitHub Action checks that the tag matches `manifest.json`, runs the model tests and publishes the release with generated notes.

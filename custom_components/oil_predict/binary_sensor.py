@@ -53,7 +53,8 @@ class OilTankSensorStaleBinarySensor(
         return {
             "sample_time": data["sample_time"],
             "reading_age_minutes": data["age_minutes"],
-            "depth_cm": data["depth_cm"],
+            "sensor_reading": data["level_reading"],
             "training_weeks": data["training_weeks"],
+            "training_weeks_needed": data["training_weeks_needed"],
             "forecast_warning": data["forecast_warning"],
         }

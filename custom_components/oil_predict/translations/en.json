@@ -2,34 +2,141 @@
   "config": {
     "step": {
       "user": {
-        "title": "Oil Monitor",
-        "description": "Choose your tank, temperature, runtime, and weather entities. A personalized forecast needs at least 14 complete, clean weeks of daily long-term statistics.",
+        "title": "Oil tank",
+        "description": "Choose the sensor that measures your tank and what it reports.",
         "data": {
-          "depth_entity": "Tank depth sensor",
-          "timestamp_entity": "Tank reading timestamp sensor",
-          "outdoor_entity": "Outdoor temperature history sensor",
-          "indoor_entity": "Indoor temperature history sensor",
-          "runtime_entity": "Daily heating runtime sensor",
-          "indoor_target_entity": "Thermostat or target temperature sensor",
-          "weather_entity": "Weather forecast entity",
-          "tank_capacity": "Usable tank capacity (L)",
-          "stale_after_minutes": "Mark the tank reading stale after (minutes)"
+          "depth_entity": "Tank level sensor",
+          "level_type": "The sensor reports",
+          "tank_capacity": "Usable tank capacity (L)"
         },
         "data_description": {
-          "depth_entity": "Select the sensor reporting distance in centimetres from the ultrasonic sensor to the oil surface.",
-          "timestamp_entity": "Select the sensor containing the time the ultrasonic measurement was actually taken, not the MQTT last-updated time.",
-          "outdoor_entity": "Select a temperature sensor with long-term statistics in °C or °F.",
-          "indoor_entity": "Select a room or thermostat temperature sensor with long-term statistics.",
-          "runtime_entity": "Select a sensor that reports daily heating runtime, preferably with long-term statistics.",
-          "indoor_target_entity": "Select your thermostat (climate entity) or a sensor holding its target temperature. The current target is used for the forecast.",
-          "weather_entity": "Select a weather entity that provides seven daily forecasts.",
-          "tank_capacity": "The first version uses the supplied depth-to-level calibration table and scales it to this capacity.",
-          "stale_after_minutes": "Your sensor normally reports about every 35 minutes. The default allows for missed reports."
+          "depth_entity": "The sensor on your oil tank. It needs long-term statistics (state class \"measurement\") for the history and estimates.",
+          "level_type": "A distance sensor (e.g. ultrasonic) measures from the sensor down to the oil. Many ready-made gauges report percent full or litres instead.",
+          "tank_capacity": "How many litres the tank holds when full."
+        }
+      },
+      "shape": {
+        "title": "Tank shape",
+        "description": "Used to turn the measured distance into litres. Measure from the sensor down to the oil surface when the tank is full, and down to the level where it should be treated as empty.",
+        "data": {
+          "tank_shape": "Tank shape",
+          "full_distance_cm": "Distance when full (cm)",
+          "empty_distance_cm": "Distance when empty (cm)",
+          "calibration": "Calibration table (custom shape only)"
+        },
+        "data_description": {
+          "tank_shape": "Most plastic bunded tanks are close to upright. Pick \"Custom\" if you have a measured table for your tank.",
+          "full_distance_cm": "Sensor-to-oil distance with a full tank.",
+          "empty_distance_cm": "Sensor-to-oil distance at the bottom (or the pump outlet).",
+          "calibration": "Only for the custom shape: distance:percent pairs, e.g. \"10:100, 60:50, 110:0\". Overrides the two distances above."
+        }
+      },
+      "sensors": {
+        "title": "Temperatures and weather",
+        "description": "These drive the usage estimates. Estimates start after about 6 complete, clean weeks of history.",
+        "data": {
+          "outdoor_entity": "Outdoor temperature sensor",
+          "indoor_entity": "Indoor temperature sensor",
+          "indoor_target_entity": "Thermostat or target temperature",
+          "weather_entity": "Weather forecast",
+          "runtime_entity": "Daily heating runtime sensor (optional)",
+          "timestamp_entity": "Tank measurement time sensor (optional)",
+          "stale_after_minutes": "Warn when the tank reading is older than (minutes)"
+        },
+        "data_description": {
+          "outdoor_entity": "A temperature sensor with long-term statistics, in °C or °F.",
+          "indoor_entity": "A room or thermostat temperature sensor with long-term statistics.",
+          "indoor_target_entity": "Your thermostat (climate entity) or a sensor holding its target temperature.",
+          "weather_entity": "A weather entity that provides seven daily forecasts.",
+          "runtime_entity": "Hours the heating has run today, resetting daily. Improves accuracy; leave empty if you don't have one.",
+          "timestamp_entity": "When the tank sensor actually took its reading. Useful for radio/MQTT sensors with retained messages; leave empty to use the time Home Assistant received the reading.",
+          "stale_after_minutes": "Set this a little longer than your sensor's normal reporting interval."
         }
       }
     },
+    "error": {
+      "invalid_calibration": "The table could not be read. Use distance:percent pairs, e.g. 10:100, 60:50, 110:0.",
+      "empty_not_below_full": "The empty distance must be larger than the full distance (the oil is further from the sensor when the tank is empty)."
+    },
     "abort": {
-      "already_configured": "Oil Monitor is already configured."
+      "already_configured": "Oil Monitor is already configured.",
+      "single_instance_allowed": "Oil Monitor is already configured."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Oil tank",
+        "description": "Choose the sensor that measures your tank and what it reports.",
+        "data": {
+          "depth_entity": "Tank level sensor",
+          "level_type": "The sensor reports",
+          "tank_capacity": "Usable tank capacity (L)"
+        },
+        "data_description": {
+          "depth_entity": "The sensor on your oil tank. It needs long-term statistics (state class \"measurement\") for the history and estimates.",
+          "level_type": "A distance sensor (e.g. ultrasonic) measures from the sensor down to the oil. Many ready-made gauges report percent full or litres instead.",
+          "tank_capacity": "How many litres the tank holds when full."
+        }
+      },
+      "shape": {
+        "title": "Tank shape",
+        "description": "Used to turn the measured distance into litres. Measure from the sensor down to the oil surface when the tank is full, and down to the level where it should be treated as empty.",
+        "data": {
+          "tank_shape": "Tank shape",
+          "full_distance_cm": "Distance when full (cm)",
+          "empty_distance_cm": "Distance when empty (cm)",
+          "calibration": "Calibration table (custom shape only)"
+        },
+        "data_description": {
+          "tank_shape": "Most plastic bunded tanks are close to upright. Pick \"Custom\" if you have a measured table for your tank.",
+          "full_distance_cm": "Sensor-to-oil distance with a full tank.",
+          "empty_distance_cm": "Sensor-to-oil distance at the bottom (or the pump outlet).",
+          "calibration": "Only for the custom shape: distance:percent pairs, e.g. \"10:100, 60:50, 110:0\". Overrides the two distances above."
+        }
+      },
+      "sensors": {
+        "title": "Temperatures and weather",
+        "description": "These drive the usage estimates. Estimates start after about 6 complete, clean weeks of history.",
+        "data": {
+          "outdoor_entity": "Outdoor temperature sensor",
+          "indoor_entity": "Indoor temperature sensor",
+          "indoor_target_entity": "Thermostat or target temperature",
+          "weather_entity": "Weather forecast",
+          "runtime_entity": "Daily heating runtime sensor (optional)",
+          "timestamp_entity": "Tank measurement time sensor (optional)",
+          "stale_after_minutes": "Warn when the tank reading is older than (minutes)"
+        },
+        "data_description": {
+          "outdoor_entity": "A temperature sensor with long-term statistics, in °C or °F.",
+          "indoor_entity": "A room or thermostat temperature sensor with long-term statistics.",
+          "indoor_target_entity": "Your thermostat (climate entity) or a sensor holding its target temperature.",
+          "weather_entity": "A weather entity that provides seven daily forecasts.",
+          "runtime_entity": "Hours the heating has run today, resetting daily. Improves accuracy; leave empty if you don't have one.",
+          "timestamp_entity": "When the tank sensor actually took its reading. Useful for radio/MQTT sensors with retained messages; leave empty to use the time Home Assistant received the reading.",
+          "stale_after_minutes": "Set this a little longer than your sensor's normal reporting interval."
+        }
+      }
+    },
+    "error": {
+      "invalid_calibration": "The table could not be read. Use distance:percent pairs, e.g. 10:100, 60:50, 110:0.",
+      "empty_not_below_full": "The empty distance must be larger than the full distance (the oil is further from the sensor when the tank is empty)."
+    }
+  },
+  "selector": {
+    "level_type": {
+      "options": {
+        "distance": "Distance to the oil surface (cm)",
+        "percent": "Percent full",
+        "litres": "Litres"
+      }
+    },
+    "tank_shape": {
+      "options": {
+        "vertical": "Upright cylinder or box (straight sides)",
+        "horizontal_cylinder": "Horizontal cylinder (round, lying on its side)",
+        "custom": "Custom calibration table"
+      }
     }
   }
 }

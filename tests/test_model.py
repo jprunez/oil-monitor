@@ -1,8 +1,8 @@
 """Tests for the pure oil tank calculations."""
 
+from datetime import date, timedelta
 from pathlib import Path
 from runpy import run_path
-from datetime import date, timedelta
 import unittest
 
 MODEL_PATH = (
@@ -13,6 +13,12 @@ MODEL_PATH = (
 )
 MODEL = run_path(str(MODEL_PATH))
 depth_to_litres = MODEL["depth_to_litres"]
+reading_to_litres = MODEL["reading_to_litres"]
+horizontal_cylinder_fraction = MODEL["horizontal_cylinder_fraction"]
+parse_calibration = MODEL["parse_calibration"]
+format_calibration = MODEL["format_calibration"]
+TankConfig = MODEL["TankConfig"]
+DEPTH_TO_PERCENT = MODEL["DEPTH_TO_PERCENT"]
 DailyTrainingSample = MODEL["DailyTrainingSample"]
 DailyHistoryPoint = MODEL["DailyHistoryPoint"]
 build_training_samples = MODEL["build_training_samples"]
@@ -21,9 +27,10 @@ forecast_week = MODEL["forecast_week"]
 parse_sample_timestamp = MODEL["parse_sample_timestamp"]
 seasonal_outdoor_c = MODEL["seasonal_outdoor_c"]
 days_until_level = MODEL["days_until_level"]
+MIN_TRAINING_WEEKS = MODEL["MIN_TRAINING_WEEKS"]
 
 
-def make_training_samples() -> list[object]:
+def make_training_samples(with_runtime: bool = True) -> list[object]:
     """Create deterministic sample days from a known synthetic relationship."""
     samples = []
     for index in range(28):
@@ -35,7 +42,7 @@ def make_training_samples() -> list[object]:
             DailyTrainingSample(
                 outdoor_mean_c=outdoor,
                 indoor_mean_c=indoor,
-                heating_hours=heating_hours,
+                heating_hours=heating_hours if with_runtime else None,
                 litres_used=litres_used,
             )
         )
@@ -43,7 +50,7 @@ def make_training_samples() -> list[object]:
 
 
 class TestDepthToLitres(unittest.TestCase):
-    """Verify the calibrated tank-volume conversion."""
+    """Verify the prototype tank's calibrated volume conversion."""
 
     def test_calibration_endpoints(self) -> None:
         """The calibration endpoints represent full and empty."""
@@ -78,6 +85,71 @@ class TestDepthToLitres(unittest.TestCase):
         self.assertIsNone(parse_sample_timestamp("not-a-timestamp"))
 
 
+class TestTankTypes(unittest.TestCase):
+    """Verify readings from different sensors and tank shapes."""
+
+    def test_default_tank_matches_prototype_table(self) -> None:
+        """The default configuration reproduces the original calibration."""
+        tank = TankConfig(capacity_litres=1000)
+        for depth in (9, 30, 54, 66, 100, 126):
+            self.assertAlmostEqual(
+                reading_to_litres(depth, tank), depth_to_litres(depth, 1000)
+            )
+
+    def test_percent_and_litre_sensors(self) -> None:
+        """Percent readings scale by capacity; litre readings pass through."""
+        percent = TankConfig(capacity_litres=1200, level_type="percent")
+        litres = TankConfig(capacity_litres=1200, level_type="litres")
+        self.assertAlmostEqual(reading_to_litres(25, percent), 300)
+        self.assertAlmostEqual(reading_to_litres(100, percent), 1200)
+        self.assertAlmostEqual(reading_to_litres(642.5, litres), 642.5)
+        with self.assertRaises(ValueError):
+            reading_to_litres(-5, percent)
+        with self.assertRaises(ValueError):
+            reading_to_litres(-1, litres)
+
+    def test_vertical_tank_is_linear_in_height(self) -> None:
+        """An upright tank's volume follows the oil height."""
+        tank = TankConfig(
+            capacity_litres=1000,
+            shape="vertical",
+            full_distance_cm=10,
+            empty_distance_cm=110,
+        )
+        self.assertAlmostEqual(reading_to_litres(10, tank), 1000)
+        self.assertAlmostEqual(reading_to_litres(60, tank), 500)
+        self.assertAlmostEqual(reading_to_litres(110, tank), 0)
+        self.assertAlmostEqual(reading_to_litres(200, tank), 0)
+
+    def test_horizontal_cylinder_volume(self) -> None:
+        """Half height is half full; a quarter height holds about 19.6 %."""
+        self.assertAlmostEqual(horizontal_cylinder_fraction(0.5), 0.5)
+        self.assertAlmostEqual(horizontal_cylinder_fraction(0.25), 0.1955, places=4)
+        tank = TankConfig(
+            capacity_litres=2000,
+            shape="horizontal_cylinder",
+            full_distance_cm=5,
+            empty_distance_cm=105,
+        )
+        self.assertAlmostEqual(reading_to_litres(55, tank), 1000)
+        self.assertAlmostEqual(reading_to_litres(80, tank), 2000 * 0.19550, delta=0.5)
+
+    def test_calibration_text_round_trip(self) -> None:
+        """Calibration tables parse from and format to editable text."""
+        text = format_calibration(DEPTH_TO_PERCENT)
+        self.assertEqual(parse_calibration(text), DEPTH_TO_PERCENT)
+        self.assertEqual(
+            parse_calibration("120:0\n10:100; 65:50"),
+            ((10.0, 100.0), (65.0, 50.0), (120.0, 0.0)),
+        )
+
+    def test_bad_calibration_text_is_rejected(self) -> None:
+        """Unusable tables raise a clear error."""
+        for text in ("", "10:100", "10-100, 20:0", "10:120, 20:0", "10:100, 10:0"):
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                parse_calibration(text)
+
+
 class TestUsageForecast(unittest.TestCase):
     """Verify learned usage rises with colder forecast conditions."""
 
@@ -89,15 +161,17 @@ class TestUsageForecast(unittest.TestCase):
         self.assertAlmostEqual(model.oil_baseline_litres_per_day, 0.8)
         self.assertAlmostEqual(model.oil_litres_per_heating_hour, 2.0)
         self.assertEqual(model.sample_count, 28)
+        self.assertTrue(model.uses_runtime)
 
-    def test_colder_week_predicts_higher_oil_use(self) -> None:
-        """Daily forecast temperatures drive a higher estimate for colder weather."""
-        model = fit_usage_model(make_training_samples())
+    def test_fit_without_runtime_sensor(self) -> None:
+        """Without runtime data, oil use is fitted straight from the gap."""
+        model = fit_usage_model(make_training_samples(with_runtime=False))
+        self.assertFalse(model.uses_runtime)
+        # litres = 0.8 + 2.0 * (0.5 + 0.4 * gap) = 1.8 + 0.8 * gap
+        self.assertAlmostEqual(model.oil_baseline_litres_per_day, 1.8)
+        self.assertAlmostEqual(model.oil_litres_per_heating_hour, 0.8)
         cold = forecast_week(model, [0.0] * 7, indoor_target_c=20.0)
-        mild = forecast_week(model, [10.0] * 7, indoor_target_c=20.0)
-        self.assertGreater(cold.total_litres, mild.total_litres)
-        self.assertTrue(all(day.predicted_litres > 0 for day in cold.days))
-        self.assertEqual(len(cold.days), 7)
+        self.assertAlmostEqual(cold.total_litres, 7 * (1.8 + 0.8 * 20), places=6)
 
     def test_fit_finds_heating_switch_off(self) -> None:
         """Warm weeks use only hot water; the fit finds where heating stops."""
@@ -128,10 +202,37 @@ class TestUsageForecast(unittest.TestCase):
         cold = forecast_week(model, [5.0] * 7, indoor_target_c=20.0)
         self.assertAlmostEqual(cold.total_litres, 7 * (1.2 + 1.5 * 0.6 * 10), places=4)
 
+    def test_colder_week_predicts_higher_oil_use(self) -> None:
+        """Daily forecast temperatures drive a higher estimate for colder weather."""
+        model = fit_usage_model(make_training_samples())
+        cold = forecast_week(model, [0.0] * 7, indoor_target_c=20.0)
+        mild = forecast_week(model, [10.0] * 7, indoor_target_c=20.0)
+        self.assertGreater(cold.total_litres, mild.total_litres)
+        self.assertTrue(all(day.predicted_litres > 0 for day in cold.days))
+        self.assertEqual(len(cold.days), 7)
+        self.assertFalse(cold.early)
+
+    def test_early_estimate_is_flagged_and_wider(self) -> None:
+        """With few weeks of history the estimate is flagged and its range widened."""
+        noisy = [
+            DailyTrainingSample(
+                outdoor_mean_c=s.outdoor_mean_c,
+                indoor_mean_c=s.indoor_mean_c,
+                heating_hours=s.heating_hours,
+                litres_used=s.litres_used + (0.3 if i % 2 else -0.3),
+            )
+            for i, s in enumerate(make_training_samples())
+        ]
+        early_model = fit_usage_model(noisy[:MIN_TRAINING_WEEKS])
+        early = forecast_week(early_model, [5.0] * 7, indoor_target_c=20.0)
+        self.assertTrue(early.early)
+        unwidened = 1.96 * early_model.oil_rmse_litres * 7**0.5
+        self.assertGreater(early.upper_litres - early.total_litres, unwidened)
+
     def test_rejects_insufficient_training_history(self) -> None:
-        """Do not fit a personalized model from too few noisy daily samples."""
-        with self.assertRaisesRegex(ValueError, "14 clean samples"):
-            fit_usage_model(make_training_samples()[:13])
+        """Do not fit a personalized model from too few noisy samples."""
+        with self.assertRaisesRegex(ValueError, f"{MIN_TRAINING_WEEKS} clean samples"):
+            fit_usage_model(make_training_samples()[: MIN_TRAINING_WEEKS - 1])
 
     def test_rejects_invalid_forecast_length(self) -> None:
         """A weekly projection must receive seven daily forecast values."""
@@ -143,17 +244,16 @@ class TestUsageForecast(unittest.TestCase):
         """Aggregate daily stats into weeks and exclude a refill discontinuity."""
         first_monday = date(2026, 1, 5)
         points = []
+        litres = 700.0
         for offset in range(-1, 21):
-            if offset < 7:
-                depth = 40 + offset
-            elif offset < 14:
-                depth = 47 + offset - 7 if offset < 10 else 20 + offset - 10
+            if offset == 9:
+                litres += 400  # delivery in the second week
             else:
-                depth = 24 + offset - 14
+                litres -= 10
             points.append(
                 DailyHistoryPoint(
                     day=first_monday + timedelta(days=offset),
-                    depth_mean_cm=float(depth),
+                    litres_mean=litres,
                     outdoor_mean_c=5.0,
                     indoor_mean_c=19.0,
                     runtime_max_hours=4.0,
@@ -162,8 +262,25 @@ class TestUsageForecast(unittest.TestCase):
 
         samples = build_training_samples(points, 1000)
         self.assertEqual(len(samples), 2)
-        self.assertGreater(samples[0].litres_used, 0)
+        self.assertAlmostEqual(samples[0].litres_used, 10.0)
         self.assertAlmostEqual(samples[0].heating_hours, 4.0)
+
+    def test_weekly_samples_without_runtime(self) -> None:
+        """Weeks without runtime data still train, with heating hours unknown."""
+        first_monday = date(2026, 1, 5)
+        points = [
+            DailyHistoryPoint(
+                day=first_monday + timedelta(days=offset),
+                litres_mean=800.0 - 12 * offset,
+                outdoor_mean_c=3.0,
+                indoor_mean_c=20.0,
+            )
+            for offset in range(-1, 7)
+        ]
+        samples = build_training_samples(points, 1000)
+        self.assertEqual(len(samples), 1)
+        self.assertIsNone(samples[0].heating_hours)
+        self.assertAlmostEqual(samples[0].litres_used, 12.0)
 
 
 class TestRunOutProjection(unittest.TestCase):
@@ -193,3 +310,7 @@ class TestRunOutProjection(unittest.TestCase):
         }
         self.assertAlmostEqual(seasonal_outdoor_c(history, date(2026, 12, 1)), 0.0)
         self.assertIsNone(seasonal_outdoor_c(history, date(2026, 6, 1)))
+
+
+if __name__ == "__main__":
+    unittest.main()

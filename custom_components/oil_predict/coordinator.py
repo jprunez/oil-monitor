@@ -1,7 +1,7 @@
 """Read Home Assistant tank entities and prepare integration data."""
 
 from collections import defaultdict
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import date, datetime, timedelta
 from functools import partial
 import logging
@@ -23,27 +23,38 @@ from homeassistant.util import dt as dt_util
 from homeassistant.util.unit_conversion import TemperatureConverter
 
 from .const import (
+    CONF_CALIBRATION,
     CONF_DEPTH_ENTITY,
+    CONF_EMPTY_DISTANCE,
+    CONF_FULL_DISTANCE,
     CONF_INDOOR_ENTITY,
     CONF_INDOOR_TARGET_ENTITY,
+    CONF_LEVEL_TYPE,
     CONF_OUTDOOR_ENTITY,
     CONF_RUNTIME_ENTITY,
     CONF_STALE_AFTER_MINUTES,
     CONF_TANK_CAPACITY,
+    CONF_TANK_SHAPE,
     CONF_TIMESTAMP_ENTITY,
     CONF_WEATHER_ENTITY,
     DOMAIN,
-    EMPTY_LITRES,
-    REORDER_LITRES,
+    EMPTY_FRACTION,
+    REORDER_FRACTION,
 )
 from .model import (
+    DEPTH_TO_PERCENT,
+    LEVEL_DISTANCE,
+    MIN_TRAINING_WEEKS,
+    SHAPE_CUSTOM,
     DailyHistoryPoint,
     DailyTrainingSample,
+    TankConfig,
     WeeklyForecast,
     build_training_samples,
     days_until_level,
-    depth_to_litres,
     fit_usage_model,
+    parse_calibration,
+    reading_to_litres,
     forecast_week,
     parse_sample_timestamp,
     predict_day,
@@ -61,6 +72,24 @@ PROJECTION_CHART_STEP = 3
 
 # How often the stale flag is re-evaluated when no new reading arrives.
 STALE_CHECK_INTERVAL = timedelta(minutes=5)
+
+
+def tank_from_config(config: Mapping[str, Any]) -> TankConfig:
+    """Build the tank description from the entry's settings."""
+    calibration = DEPTH_TO_PERCENT
+    if config.get(CONF_CALIBRATION):
+        try:
+            calibration = parse_calibration(config[CONF_CALIBRATION])
+        except ValueError as err:
+            _LOGGER.warning("Ignoring invalid tank calibration table: %s", err)
+    return TankConfig(
+        capacity_litres=float(config[CONF_TANK_CAPACITY]),
+        level_type=config.get(CONF_LEVEL_TYPE, LEVEL_DISTANCE),
+        shape=config.get(CONF_TANK_SHAPE, SHAPE_CUSTOM),
+        full_distance_cm=float(config.get(CONF_FULL_DISTANCE, DEPTH_TO_PERCENT[0][0])),
+        empty_distance_cm=float(config.get(CONF_EMPTY_DISTANCE, DEPTH_TO_PERCENT[-1][0])),
+        calibration=calibration,
+    )
 
 
 class OilPredictCoordinator(DataUpdateCoordinator[dict[str, Any]]):
@@ -88,8 +117,9 @@ class OilPredictCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._forecast_warning: str | None = None
         self._forecast_needs_retry = False
         self._target_source: str | None = None
-        self.reorder_level_litres = float(REORDER_LITRES)
-        self.empty_level_litres = float(EMPTY_LITRES)
+        self.tank = tank_from_config(entry.data)
+        self.reorder_level_litres = round(self.tank.capacity_litres * REORDER_FRACTION)
+        self.empty_level_litres = round(self.tank.capacity_litres * EMPTY_FRACTION)
         self._outdoor_history: dict[date, float] = {}
         self._daily_usage_projection: list[float] | None = None
         self._upper_scale = 1.0
@@ -106,10 +136,9 @@ class OilPredictCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     @callback
     def async_start_listeners(self) -> list[Callable[[], None]]:
         """Track source sensors so live values do not wait for the next poll."""
-        live_entities = [
-            self.entry.data[CONF_DEPTH_ENTITY],
-            self.entry.data[CONF_TIMESTAMP_ENTITY],
-        ]
+        live_entities = [self.entry.data[CONF_DEPTH_ENTITY]]
+        if self.entry.data.get(CONF_TIMESTAMP_ENTITY):
+            live_entities.append(self.entry.data[CONF_TIMESTAMP_ENTITY])
         return [
             async_track_state_change_event(
                 self.hass, live_entities, self._async_handle_live_change
@@ -171,10 +200,11 @@ class OilPredictCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self._training_samples = await self._async_load_training_history()
                 self._history_loaded_at = dt_util.utcnow()
 
-            if len(self._training_samples) < 14:
+            if len(self._training_samples) < MIN_TRAINING_WEEKS:
                 self._weekly_forecast = None
                 self._forecast_warning = (
-                    "Need at least 14 complete, clean weeks of history"
+                    f"Needs at least {MIN_TRAINING_WEEKS} complete, clean weeks of "
+                    "history; estimates start automatically once they are recorded"
                 )
                 return
 
@@ -311,47 +341,58 @@ class OilPredictCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         return None, None
 
     def _build_data(self) -> dict[str, Any]:
-        """Read current tank states, using the sensor's measurement timestamp."""
-        depth_state = self.hass.states.get(self.entry.data[CONF_DEPTH_ENTITY])
-        timestamp_state = self.hass.states.get(self.entry.data[CONF_TIMESTAMP_ENTITY])
+        """Read the current tank state and work out litres and freshness."""
+        level_state = self.hass.states.get(self.entry.data[CONF_DEPTH_ENTITY])
+        level_ok = level_state is not None and level_state.state not in (
+            "unknown",
+            "unavailable",
+        )
 
-        depth_cm: float | None = None
-        if depth_state is not None and depth_state.state not in ("unknown", "unavailable"):
+        reading: float | None = None
+        if level_ok:
             try:
-                depth_cm = float(depth_state.state)
+                reading = float(level_state.state)
             except (TypeError, ValueError):
-                _LOGGER.debug("Tank depth is not numeric: %s", depth_state.state)
+                _LOGGER.debug("Tank reading is not numeric: %s", level_state.state)
 
+        # Prefer the sensor's own measurement time; otherwise use when Home
+        # Assistant last received a report from the tank sensor.
         sample_time = None
-        if timestamp_state is not None:
-            sample_time = parse_sample_timestamp(timestamp_state.state)
+        timestamp_entity = self.entry.data.get(CONF_TIMESTAMP_ENTITY)
+        if timestamp_entity:
+            timestamp_state = self.hass.states.get(timestamp_entity)
+            if timestamp_state is not None:
+                sample_time = parse_sample_timestamp(timestamp_state.state)
+        elif level_ok:
+            sample_time = getattr(level_state, "last_reported", None) or level_state.last_updated
 
         age_minutes = None
         if sample_time is not None:
             age_seconds = (dt_util.utcnow() - sample_time).total_seconds()
-            if age_seconds >= 0:
-                age_minutes = age_seconds / 60
+            age_minutes = max(0.0, age_seconds) / 60
 
         stale_after = int(self.entry.data[CONF_STALE_AFTER_MINUTES])
         is_fresh = age_minutes is not None and age_minutes <= stale_after
 
         litres_remaining = None
-        if depth_cm is not None and depth_cm > 0:
+        if reading is not None:
             try:
-                litres_remaining = depth_to_litres(
-                    depth_cm, float(self.entry.data[CONF_TANK_CAPACITY])
-                )
+                litres_remaining = reading_to_litres(reading, self.tank)
             except ValueError:
-                _LOGGER.debug("Ignoring invalid tank depth: %s", depth_cm)
+                _LOGGER.debug("Ignoring invalid tank reading: %s", reading)
 
+        forecast = self._weekly_forecast
         return {
-            "depth_cm": depth_cm,
+            "level_reading": reading,
+            "level_unit": level_state.attributes.get("unit_of_measurement") if level_ok else None,
             "litres_remaining": litres_remaining,
             "sample_time": sample_time.isoformat() if sample_time else None,
             "age_minutes": age_minutes,
             "is_stale": not is_fresh or litres_remaining is None,
-            "weekly_forecast": self._weekly_forecast,
+            "weekly_forecast": forecast,
+            "early_estimate": bool(forecast and forecast.early),
             "training_weeks": len(self._training_samples),
+            "training_weeks_needed": MIN_TRAINING_WEEKS,
             "forecast_warning": self._forecast_warning,
             "temperature_offset_c": self.temperature_offset_c,
             "indoor_target_source": self._target_source,
@@ -391,12 +432,14 @@ class OilPredictCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """Read one year of daily long-term statistics and prepare clean weeks."""
         now = dt_util.utcnow()
         start = now - timedelta(days=370)
-        entity_ids = {
-            self.entry.data[CONF_DEPTH_ENTITY],
-            self.entry.data[CONF_OUTDOOR_ENTITY],
-            self.entry.data[CONF_INDOOR_ENTITY],
-            self.entry.data[CONF_RUNTIME_ENTITY],
+        role_to_entity = {
+            "level": self.entry.data[CONF_DEPTH_ENTITY],
+            "outdoor": self.entry.data[CONF_OUTDOOR_ENTITY],
+            "indoor": self.entry.data[CONF_INDOOR_ENTITY],
         }
+        if self.entry.data.get(CONF_RUNTIME_ENTITY):
+            role_to_entity["runtime"] = self.entry.data[CONF_RUNTIME_ENTITY]
+        entity_ids = set(role_to_entity.values())
         result = await get_instance(self.hass).async_add_executor_job(
             partial(
                 statistics_during_period,
@@ -411,12 +454,6 @@ class OilPredictCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
 
         daily: dict[date, dict[str, float]] = defaultdict(dict)
-        role_to_entity = {
-            "depth": self.entry.data[CONF_DEPTH_ENTITY],
-            "outdoor": self.entry.data[CONF_OUTDOOR_ENTITY],
-            "indoor": self.entry.data[CONF_INDOOR_ENTITY],
-            "runtime": self.entry.data[CONF_RUNTIME_ENTITY],
-        }
         for role, entity_id in role_to_entity.items():
             for row in result.get(entity_id, []):
                 timestamp = dt_util.utc_from_timestamp(row["start"])
@@ -455,19 +492,21 @@ class OilPredictCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     UnitOfTemperature.FAHRENHEIT,
                     UnitOfTemperature.CELSIUS,
                 )
+            try:
+                litres = reading_to_litres(values["level"], self.tank)
+            except ValueError:
+                continue
             history.append(
                 DailyHistoryPoint(
                     day=day,
-                    depth_mean_cm=values["depth"],
+                    litres_mean=litres,
                     outdoor_mean_c=values["outdoor"],
                     indoor_mean_c=values["indoor"],
-                    runtime_max_hours=values["runtime"],
+                    runtime_max_hours=values.get("runtime"),
                 )
             )
 
-        return build_training_samples(
-            history, float(self.entry.data[CONF_TANK_CAPACITY])
-        )
+        return build_training_samples(history, self.tank.capacity_litres)
 
     def _entity_unit(self, entity_id: str) -> str | None:
         """Return the current unit of a configured Home Assistant entity."""

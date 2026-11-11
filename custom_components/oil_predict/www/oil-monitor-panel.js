@@ -1,17 +1,3 @@
-const DEPTH_TO_PERCENT = [
-  [9, 100],
-  [17, 90],
-  [30, 80],
-  [41, 70],
-  [55, 60],
-  [66, 50],
-  [78, 40],
-  [90, 30],
-  [101, 20],
-  [113, 10],
-  [126, 0],
-];
-
 class OilMonitorPanel extends HTMLElement {
   constructor() {
     super();
@@ -278,19 +264,45 @@ class OilMonitorPanel extends HTMLElement {
     });
   }
 
-  _litresAtDepth(depth, capacity) {
-    if (!Number.isFinite(depth) || depth <= 0) return null;
-    let percent = depth <= DEPTH_TO_PERCENT[0][0] ? 100 : 0;
-    for (let index = 0; index < DEPTH_TO_PERCENT.length - 1; index += 1) {
-      const [lowDepth, lowPercent] = DEPTH_TO_PERCENT[index];
-      const [highDepth, highPercent] = DEPTH_TO_PERCENT[index + 1];
-      if (depth >= lowDepth && depth <= highDepth) {
-        const fraction = (depth - lowDepth) / (highDepth - lowDepth);
-        percent = lowPercent + fraction * (highPercent - lowPercent);
-        break;
+  // Convert a tank sensor reading to litres, mirroring the integration's
+  // model.reading_to_litres so history charts match the sensors.
+  _readingToLitres(value) {
+    const config = this._panel?.config || {};
+    const tank = config.tank || {};
+    const capacity = Number(config.tank_capacity || 1000);
+    if (!Number.isFinite(value)) return null;
+    const type = tank.level_type || "distance";
+    if (type === "litres") return value >= 0 ? value : null;
+    if (type === "percent") return value >= 0 && value <= 110 ? (capacity * Math.min(100, value)) / 100 : null;
+    if (value <= 0) return null;
+    let percent;
+    if ((tank.shape || "custom") === "custom") {
+      const table = (tank.calibration || []).map((pair) => pair.map(Number));
+      if (table.length < 2) return null;
+      if (value <= table[0][0]) percent = table[0][1];
+      else if (value >= table.at(-1)[0]) percent = table.at(-1)[1];
+      else {
+        for (let i = 0; i < table.length - 1; i += 1) {
+          const [d0, p0] = table[i];
+          const [d1, p1] = table[i + 1];
+          if (value >= d0 && value <= d1) {
+            percent = p0 + ((value - d0) / (d1 - d0)) * (p1 - p0);
+            break;
+          }
+        }
+      }
+    } else {
+      const full = Number(tank.full_distance_cm);
+      const empty = Number(tank.empty_distance_cm);
+      if (!(empty > full)) return null;
+      const h = Math.min(1, Math.max(0, (empty - value) / (empty - full)));
+      if (tank.shape === "horizontal_cylinder") {
+        const angle = 2 * Math.acos(1 - 2 * h);
+        percent = (100 * (angle - Math.sin(angle))) / (2 * Math.PI);
+      } else {
+        percent = 100 * h;
       }
     }
-    if (depth >= DEPTH_TO_PERCENT.at(-1)[0]) percent = 0;
     return (capacity * percent) / 100;
   }
 
@@ -363,12 +375,14 @@ class OilMonitorPanel extends HTMLElement {
         const interval = [anchor, ...days];
         const refill = interval.some(
           (point, index) =>
-            index > 0 && point.depth - interval[index - 1].depth <= -8,
+            index > 0 &&
+            this._readingToLitres(point.depth) - this._readingToLitres(interval[index - 1].depth) >
+              capacity * 0.05,
         );
         const oilUsed =
-          this._litresAtDepth(anchor.depth, capacity) -
-          this._litresAtDepth(days.at(-1).depth, capacity);
-        if (!refill && oilUsed >= 0 && oilUsed <= 300) {
+          this._readingToLitres(anchor.depth) -
+          this._readingToLitres(days.at(-1).depth);
+        if (!refill && Number.isFinite(oilUsed) && oilUsed >= 0 && oilUsed <= capacity * 0.3) {
           const indoorDays = days.filter((point) => Number.isFinite(point.indoor));
           weekly.push({
             day: dateKey(sunday),
@@ -548,7 +562,6 @@ class OilMonitorPanel extends HTMLElement {
     const upperId = this._findEntity(config.upper_entity, "upper estimate");
     const staleId = this._findEntity(config.stale_entity, "tank sensor stale");
     const litresState = this._state(litresId);
-    const depthState = this._state(config.depth_entity);
     const weekly = this._state(weeklyId)?.state;
     const lower = this._state(lowerId)?.state;
     const upper = this._state(upperId)?.state;
@@ -557,15 +570,8 @@ class OilMonitorPanel extends HTMLElement {
     const indoor = this._state(config.indoor_entity);
     const runtime = this._state(config.runtime_entity);
     const target = this._state(config.target_entity);
-    const timestamp = this._state(config.timestamp_entity);
     const capacity = Number(config.tank_capacity || 1000);
-    const integrationLitres = Number(litresState?.state);
-    const depthCm = Number(depthState?.state);
-    const depthEstimate = this._litresAtDepth(depthCm, capacity);
-    const litres = Number.isFinite(integrationLitres)
-      ? integrationLitres
-      : depthEstimate;
-    const usingDepthFallback = !Number.isFinite(integrationLitres) && depthEstimate !== null;
+    const litres = Number(litresState?.state);
     const percent = Number.isFinite(Number(litres)) ? Math.min(100, (Number(litres) / capacity) * 100) : 0;
     let weeks = [];
     this._chartError = null;
@@ -575,13 +581,16 @@ class OilMonitorPanel extends HTMLElement {
       this._chartError = error.message || String(error);
     }
     const staleAttrs = this._state(staleId)?.attributes || {};
+    const sampleTime = staleAttrs.sample_time || this._state(config.timestamp_entity)?.state;
     const hasEstimate = Number.isFinite(Number(weekly)) && weekly !== "";
     const trainingWeeks = Number(staleAttrs.training_weeks);
+    const weeksNeeded = Number(staleAttrs.training_weeks_needed) || 6;
+    const early = Boolean(this._state(weeklyId)?.attributes?.early_estimate);
     const estimateHint = hasEstimate
-      ? `Forecast range ${this._format(lower)}–${this._format(upper)} L`
+      ? `Forecast range ${this._format(lower)}–${this._format(upper)} L${early ? ` · early estimate from ${this._format(trainingWeeks)} weeks of history, improving as more is recorded` : ""}`
       : this._escape(
           [
-            Number.isFinite(trainingWeeks) ? `${trainingWeeks} clean weeks of history (14 needed).` : "",
+            Number.isFinite(trainingWeeks) ? `${trainingWeeks} of ${weeksNeeded} clean weeks of history so far.` : "",
             staleAttrs.forecast_warning || "Not available yet.",
           ].filter(Boolean).join(" "),
         );
@@ -612,8 +621,8 @@ class OilMonitorPanel extends HTMLElement {
       <main class="page">
         <header class="top"><div><div class="eyebrow">Home energy · heating oil</div><h1 class="title">Oil Monitor</h1><p class="subtitle">Your tank, usage trends and weather-aware outlook</p></div><div class="toolbar"><button type="button" class="refresh" title="Refresh history">↻</button></div></header>
         <section class="section"><h2>Right now</h2><p>Measured by your sensors.</p><div class="grid">
-          <article class="card"><div class="metric-label">${stale ? "Last known oil remaining" : "Oil remaining"}</div><div class="metric">${this._format(litres)} <span class="unit">L</span></div><div class="hint">${usingDepthFallback ? `Calculated from ${this._format(depthCm, 0)} cm depth` : "of " + this._format(capacity) + " L usable capacity"}</div><div class="level"><i style="width:${percent}%"></i></div></article>
-          <article class="card"><div class="metric-label">Tank reading</div><div class="metric ${stale ? "warn" : ""}">${stale ? "Check sensor" : "Up to date"}</div><div class="hint" title="${this._escape(timestamp?.state || "")}">${this._escape(this._friendlySampleTime(timestamp?.state))}</div></article>
+          <article class="card"><div class="metric-label">${stale ? "Last known oil remaining" : "Oil remaining"}</div><div class="metric">${this._format(litres)} <span class="unit">L</span></div><div class="hint">of ${this._format(capacity)} L usable capacity</div><div class="level"><i style="width:${percent}%"></i></div></article>
+          <article class="card"><div class="metric-label">Tank reading</div><div class="metric ${stale ? "warn" : ""}">${stale ? "Check sensor" : "Up to date"}</div><div class="hint" title="${this._escape(sampleTime || "")}">${this._escape(this._friendlySampleTime(sampleTime))}</div></article>
           <article class="card"><div class="metric-label">Indoor temperature</div><div class="metric">${this._format(indoor?.state, 1)} <span class="unit">${indoor?.attributes?.unit_of_measurement || "°C"}</span></div><div class="hint">Thermostat set to ${this._format(targetValue, 1)} ${targetUnit}</div></article>
           <article class="card"><div class="metric-label">Outdoor temperature</div><div class="metric">${this._format(outdoor?.state, 1)} <span class="unit">${outdoor?.attributes?.unit_of_measurement || "°C"}</span></div><div class="hint">Heating ran ${runtimeValue} today</div></article>
         </div>
@@ -637,7 +646,7 @@ class OilMonitorPanel extends HTMLElement {
           <article class="chart-card"><h3>Weekly oil use & outdoor temperature</h3><p>Bars and blue line: litres used · orange: mean outdoor temperature</p>${this._chart(weeks)}<div class="legend"><span><i class="key"></i>Oil use (L/week)</span><span><i class="key temp"></i>Outdoor temperature</span></div></article>
           <article class="chart-card"><h3>Oil use vs outdoor temperature</h3><p>Each point is a clean week. The dashed curve flattens to hot-water-only use above the temperature where heating switches off.</p>${this._scatter(weeks)}</article>
         </div></section>
-        <p class="foot">Dashboard build ${this._escape(config.build || "unknown")}</p>
+        <p class="foot">Oil Monitor ${config.version ? `v${this._escape(config.version)}` : ""} · build ${this._escape(config.build || "unknown")}</p>
       </main>`;
 
     this.shadowRoot.querySelectorAll("[data-level-entity]").forEach((input) => {
