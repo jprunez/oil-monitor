@@ -74,6 +74,8 @@ class OilPredictCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._training_samples: list[DailyTrainingSample] = []
         self._weekly_forecast: WeeklyForecast | None = None
         self._forecast_warning: str | None = None
+        self._forecast_needs_retry = False
+        self._target_source: str | None = None
 
     @property
     def device_info(self) -> DeviceInfo:
@@ -120,6 +122,10 @@ class OilPredictCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     @callback
     def _async_handle_stale_check(self, _now: datetime) -> None:
         self._async_push_live_data()
+        if self._forecast_needs_retry:
+            # A missing input (weather or temperature) is usually transient;
+            # retry soon instead of waiting for the 3-hour refresh.
+            self.hass.async_create_task(self.async_request_refresh())
 
     async def _async_handle_target_change(
         self, _event: Event[EventStateChangedData]
@@ -133,9 +139,7 @@ class OilPredictCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     async def _async_update_forecast(self) -> None:
         """Refresh training history when due and recalculate the weekly forecast."""
-        temperature_target = self._read_temperature_c(
-            self.entry.data[CONF_INDOOR_TARGET_ENTITY]
-        )
+        self._forecast_needs_retry = False
         try:
             if (
                 self._history_loaded_at is None
@@ -144,25 +148,56 @@ class OilPredictCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self._training_samples = await self._async_load_training_history()
                 self._history_loaded_at = dt_util.utcnow()
 
-            if len(self._training_samples) >= 14 and temperature_target is not None:
-                model = fit_usage_model(self._training_samples)
-                forecast_temperatures = await self._async_get_daily_forecast_c()
-                self._weekly_forecast = forecast_week(
-                    model,
-                    forecast_temperatures,
-                    temperature_target + self.temperature_offset_c,
-                )
-                self._forecast_warning = None
-            else:
+            if len(self._training_samples) < 14:
                 self._weekly_forecast = None
                 self._forecast_warning = (
-                    "Need at least 14 complete, clean weeks of history and a valid "
-                    "indoor target temperature"
+                    "Need at least 14 complete, clean weeks of history"
                 )
+                return
+
+            temperature_target, self._target_source = self._forecast_indoor_target()
+            if temperature_target is None:
+                # Source sensors are often still loading just after a restart.
+                self._forecast_needs_retry = True
+                self._weekly_forecast = None
+                self._forecast_warning = (
+                    "Could not read the thermostat target or indoor temperature"
+                )
+                return
+
+            model = fit_usage_model(self._training_samples)
+            forecast_temperatures = await self._async_get_daily_forecast_c()
+            self._weekly_forecast = forecast_week(
+                model,
+                forecast_temperatures,
+                temperature_target + self.temperature_offset_c,
+            )
+            self._forecast_warning = None
         except (HomeAssistantError, ValueError, TypeError, KeyError) as err:
             _LOGGER.warning("Could not calculate the oil forecast: %s", err)
+            self._forecast_needs_retry = True
             self._weekly_forecast = None
             self._forecast_warning = str(err)
+
+    def _forecast_indoor_target(self) -> tuple[float | None, str | None]:
+        """Pick the indoor temperature the forecast should assume.
+
+        Prefer the thermostat target; fall back to the current indoor
+        temperature, then to the recent average indoor temperature in history.
+        """
+        target = self._read_temperature_c(self.entry.data[CONF_INDOOR_TARGET_ENTITY])
+        if target is not None:
+            return target, "thermostat target"
+        indoor = self._read_temperature_c(self.entry.data[CONF_INDOOR_ENTITY])
+        if indoor is not None:
+            return indoor, "current indoor temperature"
+        if self._training_samples:
+            recent = self._training_samples[-4:]
+            return (
+                sum(sample.indoor_mean_c for sample in recent) / len(recent),
+                "recent average indoor temperature",
+            )
+        return None, None
 
     def _build_data(self) -> dict[str, Any]:
         """Read current tank states, using the sensor's measurement timestamp."""
@@ -208,6 +243,7 @@ class OilPredictCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "training_weeks": len(self._training_samples),
             "forecast_warning": self._forecast_warning,
             "temperature_offset_c": self.temperature_offset_c,
+            "indoor_target_source": self._target_source,
         }
 
     def _read_temperature_c(self, entity_id: str) -> float | None:

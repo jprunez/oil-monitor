@@ -11,5 +11,5 @@
   "integration_type": "service",
   "iot_class": "calculated",
   "single_config_entry": true,
-  "version": "0.1.3"
+  "version": "0.1.4"
 }

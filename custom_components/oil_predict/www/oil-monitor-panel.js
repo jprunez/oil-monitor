@@ -379,7 +379,7 @@ class OilMonitorPanel extends HTMLElement {
       ? `Forecast range ${this._format(lower)}–${this._format(upper)} L`
       : this._escape(
           [
-            Number.isFinite(trainingWeeks) ? `${trainingWeeks} of 14 clean weeks of history.` : "",
+            Number.isFinite(trainingWeeks) ? `${trainingWeeks} clean weeks of history (14 needed).` : "",
             staleAttrs.forecast_warning || "Not available yet.",
           ].filter(Boolean).join(" "),
         );

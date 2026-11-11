@@ -95,7 +95,11 @@ class WeeklyOilUsageSensor(CoordinatorEntity[OilPredictCoordinator], SensorEntit
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
         """Expose the indoor-temperature adjustment the estimate was made with."""
-        return {"temperature_offset_c": self.coordinator.data["temperature_offset_c"]}
+        data = self.coordinator.data
+        return {
+            "temperature_offset_c": data["temperature_offset_c"],
+            "indoor_target_source": data["indoor_target_source"],
+        }
 
     @property
     def available(self) -> bool:
