@@ -146,7 +146,10 @@ class OilMonitorPanel extends HTMLElement {
       ["indoor", config.indoor_entity],
     ]) {
       for (const row of this._statistics[id] || []) {
-        const day = dayFormat.format(new Date(row.start * 1000));
+        const start = Number(row.start);
+        if (!Number.isFinite(start)) continue;
+        // The websocket API reports milliseconds; older versions used seconds.
+        const day = dayFormat.format(new Date(start > 1e11 ? start : start * 1000));
         const point = byDay.get(day) || { day };
         point[key] = row.mean;
         byDay.set(day, point);
@@ -220,9 +223,38 @@ class OilMonitorPanel extends HTMLElement {
       .join(" ");
   }
 
+  _escape(text) {
+    return String(text).replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
+  }
+
+  _chartProblem(weeks) {
+    if (this._chartError) return `Could not draw the charts: ${this._chartError}`;
+    if (!this._statistics) {
+      return this._loading ? "Loading history…" : "History has not loaded yet.";
+    }
+    const config = this._panel?.config || {};
+    const missing = [config.depth_entity, config.outdoor_entity].filter(
+      (id) => id && !this._statistics[id]?.length,
+    );
+    if (missing.length) {
+      return `No long-term statistics found for ${missing.join(" and ")}. Home Assistant only keeps daily statistics for sensors with a state class of "measurement" (check under Developer tools → Statistics).`;
+    }
+    if (!weeks.length) {
+      const days = this._dailyRows().filter(
+        (row) => Number.isFinite(row.depth) && Number.isFinite(row.outdoor),
+      ).length;
+      return `Found ${days} day${days === 1 ? "" : "s"} of tank and temperature history in this range, but no complete clean week yet. A week needs daily data for Monday–Sunday plus the Sunday before, with no refill.`;
+    }
+    return null;
+  }
+
+  _empty(message) {
+    return `<div class="empty">${this._escape(message)}</div>`;
+  }
+
   _chart(weeks) {
     if (!weeks.length) {
-      return `<div class="empty">Waiting for enough clean weekly tank and temperature history to draw the trend.</div>`;
+      return this._empty(this._chartProblem(weeks) || "No weekly data to show.");
     }
     const width = 900;
     const height = 270;
@@ -271,7 +303,10 @@ class OilMonitorPanel extends HTMLElement {
   _scatter(weeks) {
     const valid = weeks.filter((row) => row.litres >= 0 && Number.isFinite(row.outdoor));
     if (valid.length < 4) {
-      return `<div class="empty">More clean weekly readings are needed for the temperature comparison.</div>`;
+      return this._empty(
+        this._chartProblem(weeks) ||
+          `${valid.length} clean week${valid.length === 1 ? "" : "s"} so far; the comparison needs at least 4.`,
+      );
     }
     const width = 520;
     const height = 230;
@@ -330,7 +365,24 @@ class OilMonitorPanel extends HTMLElement {
       : depthEstimate;
     const usingDepthFallback = !Number.isFinite(integrationLitres) && depthEstimate !== null;
     const percent = Number.isFinite(Number(litres)) ? Math.min(100, (Number(litres) / capacity) * 100) : 0;
-    const weeks = this._weeklyRows();
+    let weeks = [];
+    this._chartError = null;
+    try {
+      weeks = this._weeklyRows();
+    } catch (error) {
+      this._chartError = error.message || String(error);
+    }
+    const staleAttrs = this._state(staleId)?.attributes || {};
+    const hasEstimate = Number.isFinite(Number(weekly)) && weekly !== "";
+    const trainingWeeks = Number(staleAttrs.training_weeks);
+    const estimateHint = hasEstimate
+      ? `Forecast range ${this._format(lower)}–${this._format(upper)} L`
+      : this._escape(
+          [
+            Number.isFinite(trainingWeeks) ? `${trainingWeeks} of 14 clean weeks of history.` : "",
+            staleAttrs.forecast_warning || "Not available yet.",
+          ].filter(Boolean).join(" "),
+        );
     const status = stale ? "Tank reading is stale — forecast confidence is reduced." : "Tank reading is current.";
     const isClimate = target?.entity_id?.startsWith("climate.");
     const targetValue = isClimate ? target.attributes.temperature : target?.state;
@@ -352,11 +404,11 @@ class OilMonitorPanel extends HTMLElement {
         <header class="top"><div><div class="eyebrow">Home energy · heating oil</div><h1 class="title">Oil Monitor</h1><p class="subtitle">Your tank, usage trends and weather-aware outlook</p></div><div class="toolbar"><select aria-label="History range"><option value="30" ${this._rangeDays === 30 ? "selected" : ""}>30 days</option><option value="90" ${this._rangeDays === 90 ? "selected" : ""}>90 days</option><option value="365" ${this._rangeDays === 365 ? "selected" : ""}>1 year</option></select><button type="button" class="refresh" title="Refresh history">↻</button></div></header>
         <section class="grid" aria-label="Oil summary">
           <article class="card"><div class="metric-label">${stale ? "Last known oil remaining" : "Oil remaining"}</div><div class="metric">${this._format(litres)} <span class="unit">L</span></div><div class="hint">${usingDepthFallback ? `Calculated from ${this._format(depthCm, 0)} cm depth` : "of " + this._format(capacity) + " L usable capacity"}</div><div class="level"><i style="width:${percent}%"></i></div></article>
-          <article class="card"><div class="metric-label">Estimated use · next 7 days</div><div class="metric">${this._format(weekly)} <span class="unit">L</span></div><div class="hint">Forecast range ${this._format(lower)}–${this._format(upper)} L${offsetNote}</div></article>
+          <article class="card"><div class="metric-label">Estimated use · next 7 days</div><div class="metric">${this._format(weekly)} <span class="unit">L</span></div><div class="hint">${estimateHint}${hasEstimate ? offsetNote : ""}</div></article>
           <article class="card"><div class="metric-label">Outdoor temperature</div><div class="metric">${this._format(outdoor?.state, 1)} <span class="unit">${outdoor?.attributes?.unit_of_measurement || "°C"}</span></div><div class="hint">Current weather sensor</div></article>
           <article class="card"><div class="metric-label">Tank reading</div><div class="metric ${stale ? "warn" : ""}">${stale ? "Check sensor" : "Current"}</div><div class="hint">Measurement timestamp ${timestamp?.state || "not available"}</div></article>
         </section>
-        <div class="status ${stale ? "warn" : ""}">${status}${this._loading ? " Loading recorder history…" : ""}${this._error ? ` History: ${this._error}` : ""}</div>
+        <div class="status ${stale ? "warn" : ""}">${status}${this._loading ? " Loading recorder history…" : ""}${this._error ? ` History: ${this._escape(this._error)}` : ""}</div>
         <section class="section"><h2>Usage and weather over time</h2><p>Weekly tank-level changes are converted with your tank calibration and compared with weekly outdoor temperatures. Refill and suspect weeks are excluded.</p><div class="charts">
           <article class="chart-card"><h3>Weekly oil use & outdoor temperature</h3><p>Bars and blue line: litres used · orange: mean outdoor temperature</p>${this._chart(weeks)}<div class="legend"><span><i class="key"></i>Oil use (L/week)</span><span><i class="key temp"></i>Outdoor temperature</span></div></article>
           <article class="chart-card"><h3>Oil use vs outdoor temperature</h3><p>Each point is a clean week. Dashed line shows a simple trend, not a guarantee.</p>${this._scatter(weeks)}</article>
