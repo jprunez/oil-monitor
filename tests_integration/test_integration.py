@@ -168,10 +168,10 @@ async def test_percent_sensor_without_timestamp_sensor(hass: HomeAssistant, reco
     # Defaults scale with the tank: reorder at 25 %, empty at 5 %.
     assert float(_entity_state(hass, entry, "number", "reorder_level").state) == 375
     assert float(_entity_state(hass, entry, "number", "empty_level").state) == 75
-    # Not enough history yet: the estimate explains why.
+    # No recorded history at all: the estimate says which sensors lack it.
     stale_attrs = _entity_state(hass, entry, "binary_sensor", "tank_sensor_stale").attributes
     assert stale_attrs["training_weeks"] == 0
-    assert "6 complete, clean weeks" in stale_attrs["forecast_warning"]
+    assert "No daily history was found for tank (sensor.tank_pct)" in stale_attrs["forecast_warning"]
 
 
 async def test_live_update_and_stale_reading(hass: HomeAssistant, recorder_mock) -> None:

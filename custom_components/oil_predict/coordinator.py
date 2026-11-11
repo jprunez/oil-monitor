@@ -117,6 +117,8 @@ class OilPredictCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._forecast_warning: str | None = None
         self._forecast_needs_retry = False
         self._target_source: str | None = None
+        self._history_days: dict[str, int] = {}
+        self._history_entities: dict[str, str] = {}
         self.tank = tank_from_config(entry.data)
         self.reorder_level_litres = round(self.tank.capacity_litres * REORDER_FRACTION)
         self.empty_level_litres = round(self.tank.capacity_litres * EMPTY_FRACTION)
@@ -202,10 +204,7 @@ class OilPredictCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
             if len(self._training_samples) < MIN_TRAINING_WEEKS:
                 self._weekly_forecast = None
-                self._forecast_warning = (
-                    f"Needs at least {MIN_TRAINING_WEEKS} complete, clean weeks of "
-                    "history; estimates start automatically once they are recorded"
-                )
+                self._forecast_warning = self._history_warning()
                 return
 
             temperature_target, self._target_source = self._forecast_indoor_target()
@@ -237,6 +236,32 @@ class OilPredictCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._forecast_needs_retry = True
             self._weekly_forecast = None
             self._forecast_warning = str(err)
+
+    def _history_warning(self) -> str:
+        """Explain why there are not enough clean weeks to estimate from."""
+        labels = {
+            "level": "tank",
+            "outdoor": "outdoor temperature",
+            "indoor": "indoor temperature",
+            "runtime": "heating runtime",
+        }
+        missing = [
+            f"{labels[role]} ({self._history_entities[role]})"
+            for role, days in self._history_days.items()
+            if days == 0
+        ]
+        if missing:
+            return (
+                "No daily history was found for "
+                + ", ".join(missing)
+                + ". That sensor needs long-term statistics (state class "
+                "\"measurement\", or \"total\" for a runtime counter); choose another "
+                "sensor under Configure, or leave the optional runtime sensor empty."
+            )
+        return (
+            f"Needs at least {MIN_TRAINING_WEEKS} complete, clean weeks of history; "
+            "estimates start automatically once they are recorded"
+        )
 
     def _project_daily_usage(
         self,
@@ -393,6 +418,7 @@ class OilPredictCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "early_estimate": bool(forecast and forecast.early),
             "training_weeks": len(self._training_samples),
             "training_weeks_needed": MIN_TRAINING_WEEKS,
+            "history_days": dict(self._history_days),
             "forecast_warning": self._forecast_warning,
             "temperature_offset_c": self.temperature_offset_c,
             "indoor_target_source": self._target_source,
@@ -449,7 +475,7 @@ class OilPredictCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 entity_ids,
                 "day",
                 None,
-                {"mean", "max"},
+                {"mean", "max", "change"},
             )
         )
 
@@ -458,9 +484,22 @@ class OilPredictCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             for row in result.get(entity_id, []):
                 timestamp = dt_util.utc_from_timestamp(row["start"])
                 local_day = dt_util.as_local(timestamp).date()
-                value = row.get("max") if role == "runtime" else row.get("mean")
+                if role == "runtime":
+                    # A runtime that resets daily has a daily maximum; a
+                    # counter that keeps adding up has a daily increase.
+                    value = row.get("max")
+                    if value is None:
+                        value = row.get("change")
+                else:
+                    value = row.get("mean")
                 if value is not None:
                     daily[local_day][role] = float(value)
+
+        self._history_days = {
+            role: sum(1 for values in daily.values() if role in values)
+            for role in role_to_entity
+        }
+        self._history_entities = role_to_entity
 
         history: list[DailyHistoryPoint] = []
         outdoor_unit = self._entity_unit(self.entry.data[CONF_OUTDOOR_ENTITY])
