@@ -103,6 +103,9 @@ class WeeklyOilUsageSensor(CoordinatorEntity[OilPredictCoordinator], SensorEntit
             "temperature_offset_c": data["temperature_offset_c"],
             "indoor_target_source": data["indoor_target_source"],
             "early_estimate": data["early_estimate"],
+            "typical_weekly_error_litres": (
+                round(data["backtest"]["typical_error_litres"], 1) if data["backtest"] else None
+            ),
             "training_weeks": data["training_weeks"],
         }
 

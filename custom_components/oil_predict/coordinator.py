@@ -2,6 +2,7 @@
 
 from collections import defaultdict
 from collections.abc import Callable, Mapping
+from dataclasses import asdict
 from datetime import date, datetime, timedelta
 from functools import partial
 import logging
@@ -56,9 +57,11 @@ from .model import (
     SHAPE_CUSTOM,
     DailyHistoryPoint,
     DailyTrainingSample,
+    BacktestResult,
     TankConfig,
     UsageModel,
     WeeklyForecast,
+    backtest_weekly,
     build_training_samples,
     climate_offset,
     days_until_level,
@@ -138,6 +141,7 @@ class OilPredictCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.temp_correction: dict[str, Any] = {"active": False, "checked": False}
         self._weather_error: str | None = None
         self.model: UsageModel | None = None
+        self.backtest: BacktestResult | None = None
         self._history_entities: dict[str, str] = {}
         self.tank = tank_from_config(entry.data)
         self.reorder_level_litres = round(self.tank.capacity_litres * REORDER_FRACTION)
@@ -233,6 +237,11 @@ class OilPredictCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             ):
                 self._training_samples = await self._async_load_training_history()
                 self._history_loaded_at = dt_util.utcnow()
+                # Score past weeks with models that never saw them (many small
+                # fits, so off the event loop).
+                self.backtest = await self.hass.async_add_executor_job(
+                    backtest_weekly, self._training_samples
+                )
 
             if len(self._training_samples) < MIN_TRAINING_WEEKS:
                 self._weekly_forecast = None
@@ -259,7 +268,10 @@ class OilPredictCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._weather_error = None
             indoor_target = temperature_target + self.temperature_offset_c
             self._weekly_forecast = forecast_week(
-                model, forecast_temperatures, indoor_target
+                model,
+                forecast_temperatures,
+                indoor_target,
+                self.backtest.rmse_litres if self.backtest else None,
             )
             await self._async_build_scenarios(
                 model, forecast_temperatures, indoor_target
@@ -681,6 +693,7 @@ class OilPredictCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "indoor_history_fallback_c": self._indoor_fallback_c,
             "temp_correction": dict(self.temp_correction),
             "scenario_info": dict(self.scenario_info) if self.scenario_info else None,
+            "backtest": asdict(self.backtest) if self.backtest else None,
             "setup_check": self.setup_check(),
             "forecast_warning": self._forecast_warning,
             "temperature_offset_c": self.temperature_offset_c,

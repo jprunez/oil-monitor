@@ -643,8 +643,12 @@ class OilMonitorPanel extends HTMLElement {
     const trainingWeeks = Number(staleAttrs.training_weeks);
     const weeksNeeded = Number(staleAttrs.training_weeks_needed) || 6;
     const early = Boolean(this._state(weeklyId)?.attributes?.early_estimate);
+    const backtest = staleAttrs.backtest;
+    const accuracyNote = backtest && Number.isFinite(backtest.typical_error_litres)
+      ? ` · past weekly forecasts were typically within ±${this._format(Math.max(1, Math.round(backtest.typical_error_litres)))} L of actual use (checked on ${this._format(backtest.weeks)} weeks)`
+      : "";
     const estimateHint = hasEstimate
-      ? `Forecast range ${this._format(lower)}–${this._format(upper)} L${early ? ` · early estimate from ${this._format(trainingWeeks)} weeks of history, improving as more is recorded` : ""}`
+      ? `Forecast range ${this._format(lower)}–${this._format(upper)} L${accuracyNote}${early ? ` · early estimate from ${this._format(trainingWeeks)} weeks of history, improving as more is recorded` : ""}`
       : this._escape(
           [
             Number.isFinite(trainingWeeks) ? `${trainingWeeks} of ${weeksNeeded} clean weeks of history so far.` : "",

@@ -105,6 +105,7 @@ async def async_get_config_entry_diagnostics(
         "setup_check": data.get("setup_check"),
         "temp_correction": data.get("temp_correction"),
         "scenarios": data.get("scenario_info"),
+        "backtest": data.get("backtest"),
         "sources": {
             key: _source(hass, entry.data.get(key)) for key in SOURCE_KEYS
         },

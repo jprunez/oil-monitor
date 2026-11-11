@@ -32,6 +32,7 @@ estimate_temperature_drift = MODEL["estimate_temperature_drift"]
 climate_offset = MODEL["climate_offset"]
 historical_year_temperatures = MODEL["historical_year_temperatures"]
 pick_scenarios = MODEL["pick_scenarios"]
+backtest_weekly = MODEL["backtest_weekly"]
 temperature_corrected_distance = MODEL["temperature_corrected_distance"]
 
 
@@ -408,6 +409,45 @@ class TestWinterScenarios(unittest.TestCase):
         self.assertEqual(mild[0], 11.0)  # 10th percentile year
         self.assertEqual(cold[0], 18.0)  # 90th percentile year
         self.assertIsNone(pick_scenarios(yearly[:4]))
+
+
+
+class TestBacktest(unittest.TestCase):
+    """Verify how past weekly forecasts are scored."""
+
+    def test_perfect_relationship_scores_near_zero(self) -> None:
+        """Noise-free history is predicted almost exactly."""
+        result = backtest_weekly(make_training_samples())
+        self.assertEqual(result.weeks, 28)
+        self.assertLess(result.typical_error_litres, 1e-6)
+        self.assertLess(result.rmse_litres, 1e-6)
+
+    def test_noisy_history_scores_its_noise(self) -> None:
+        """Weeks that vary by about 0.5 L/day score roughly 3.5 L/week off."""
+        noisy = [
+            DailyTrainingSample(
+                outdoor_mean_c=s.outdoor_mean_c,
+                indoor_mean_c=s.indoor_mean_c,
+                heating_hours=s.heating_hours,
+                litres_used=s.litres_used + (0.5 if (i * 7) % 3 else -0.5),
+            )
+            for i, s in enumerate(make_training_samples())
+        ]
+        result = backtest_weekly(noisy)
+        self.assertGreater(result.typical_error_litres, 2.0)
+        self.assertLess(result.typical_error_litres, 6.0)
+        self.assertGreater(result.mean_weekly_use_litres, 50)
+        # The forecast range follows the measured weekly error.
+        model = fit_usage_model(noisy)
+        scored = forecast_week(model, [5.0] * 7, 20.0, weekly_error_rmse=result.rmse_litres)
+        self.assertAlmostEqual(
+            scored.upper_litres - scored.total_litres, 1.96 * result.rmse_litres
+        )
+
+    def test_needs_one_week_more_than_the_minimum(self) -> None:
+        """With only the minimum weeks there is nothing to hold out."""
+        self.assertIsNone(backtest_weekly(make_training_samples()[:MIN_TRAINING_WEEKS]))
+        self.assertIsNotNone(backtest_weekly(make_training_samples()[: MIN_TRAINING_WEEKS + 1]))
 
 
 if __name__ == "__main__":

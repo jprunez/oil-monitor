@@ -412,6 +412,14 @@ async def test_winter_scenarios(
         assert rows["scenarios"]["status"] == "warning"
         assert "offline" in rows["scenarios"]["message"]
 
+    # Past weeks were scored, and the 7-day range uses that score.
+    backtest = stale.attributes["backtest"]
+    assert backtest["weeks"] >= 12
+    weekly = state("sensor", "weekly_oil_use_total")
+    upper = state("sensor", "weekly_oil_use_upper")
+    assert weekly.attributes["typical_weekly_error_litres"] == round(backtest["typical_error_litres"], 1)
+    assert float(upper.state) - float(weekly.state) == pytest.approx(1.96 * backtest["rmse_litres"], abs=0.01)
+
     empty = state("sensor", "days_until_empty")
     typical = float(empty.state)
     assert empty.attributes["earliest_days"] < typical < empty.attributes["latest_days"]

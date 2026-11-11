@@ -492,6 +492,7 @@ def forecast_week(
     model: UsageModel,
     forecast_outdoor_mean_c: Sequence[float],
     indoor_target_c: float,
+    weekly_error_rmse: float | None = None,
 ) -> WeeklyForecast:
     """Estimate oil consumption day by day from the coming week's weather."""
     if len(forecast_outdoor_mean_c) != 7:
@@ -518,6 +519,10 @@ def forecast_week(
         + (model.oil_litres_per_heating_hour * model.runtime_rmse_hours) ** 2
     )
     uncertainty = 1.96 * daily_error * math.sqrt(len(days))
+    if weekly_error_rmse is not None:
+        # Prefer how far past weekly forecasts actually missed (see
+        # ``backtest_weekly``) over the in-sample fit error.
+        uncertainty = 1.96 * weekly_error_rmse
     if model.is_early:
         # Few weeks of history understate the error; widen the range.
         uncertainty *= math.sqrt(FULL_CONFIDENCE_WEEKS / model.sample_count)
@@ -775,3 +780,50 @@ def pick_scenarios(
     mild = list(ranked[round(MILD_QUANTILE * (count - 1))][:length])
     cold = list(ranked[round(COLD_QUANTILE * (count - 1))][:length])
     return typical, mild, cold
+
+
+# --- Scoring past forecasts ----------------------------------------------------
+@dataclass(frozen=True)
+class BacktestResult:
+    """How well the model would have predicted each past week (litres per week)."""
+
+    weeks: int
+    typical_error_litres: float  # median absolute weekly error
+    rmse_litres: float
+    bias_litres: float  # positive: forecasts ran high
+    mean_weekly_use_litres: float
+
+
+def backtest_weekly(samples: Sequence[DailyTrainingSample]) -> BacktestResult | None:
+    """Score the model on every past week using a model that never saw it.
+
+    Each week in turn is left out, the model is fitted to the remaining
+    weeks, and the left-out week's use is predicted from its own indoor and
+    outdoor temperatures. Returns None when there are too few weeks to fit a
+    model without one of them.
+    """
+    if len(samples) < MIN_TRAINING_WEEKS + 1:
+        return None
+    errors: list[float] = []
+    for index, held_out in enumerate(samples):
+        others = [sample for i, sample in enumerate(samples) if i != index]
+        try:
+            model = fit_usage_model(others)
+        except ValueError:
+            return None
+        _, predicted = predict_day(model, held_out.outdoor_mean_c, held_out.indoor_mean_c)
+        errors.append(7 * (predicted - held_out.litres_used))
+    absolute = sorted(abs(error) for error in errors)
+    middle = len(absolute) // 2
+    median = (
+        absolute[middle]
+        if len(absolute) % 2
+        else (absolute[middle - 1] + absolute[middle]) / 2
+    )
+    return BacktestResult(
+        weeks=len(errors),
+        typical_error_litres=median,
+        rmse_litres=math.sqrt(sum(error**2 for error in errors) / len(errors)),
+        bias_litres=sum(errors) / len(errors),
+        mean_weekly_use_litres=7 * sum(s.litres_used for s in samples) / len(samples),
+    )
