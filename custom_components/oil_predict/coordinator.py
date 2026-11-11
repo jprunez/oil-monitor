@@ -55,6 +55,10 @@ _LOGGER = logging.getLogger(__name__)
 # How far ahead the run-out projection looks.
 PROJECTION_DAYS = 365
 
+# The dashboard chart shows this many days, one point every few days.
+PROJECTION_CHART_DAYS = 182
+PROJECTION_CHART_STEP = 3
+
 # How often the stale flag is re-evaluated when no new reading arrives.
 STALE_CHECK_INTERVAL = timedelta(minutes=5)
 
@@ -231,6 +235,30 @@ class OilPredictCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             usage.append(predict_day(model, outdoor, indoor_target_c)[1])
         return usage
 
+    def _level_projection(self, litres: float | None) -> list[dict[str, Any]] | None:
+        """Projected litres every few days for about six months, for charting.
+
+        ``litres`` is the central estimate; ``cautious`` uses the upper end of
+        the usage range (the tank empties sooner).
+        """
+        if litres is None or self._daily_usage_projection is None:
+            return None
+        today = dt_util.now().date()
+        points: list[dict[str, Any]] = []
+        central = cautious = litres
+        for offset, use in enumerate(self._daily_usage_projection[:PROJECTION_CHART_DAYS + 1]):
+            if offset % PROJECTION_CHART_STEP == 0:
+                points.append(
+                    {
+                        "date": (today + timedelta(days=offset)).isoformat(),
+                        "litres": round(max(0.0, central), 1),
+                        "cautious": round(max(0.0, cautious), 1),
+                    }
+                )
+            central -= use
+            cautious -= use * self._upper_scale
+        return points
+
     def _run_out(self, litres: float | None, level: float) -> dict[str, Any]:
         """Days and dates until the tank reaches ``level`` (central and earliest)."""
         result: dict[str, Any] = {
@@ -329,6 +357,7 @@ class OilPredictCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "indoor_target_source": self._target_source,
             "reorder": self._run_out(litres_remaining, self.reorder_level_litres),
             "empty": self._run_out(litres_remaining, self.empty_level_litres),
+            "level_projection": self._level_projection(litres_remaining),
         }
 
     def _read_temperature_c(self, entity_id: str) -> float | None:

@@ -83,7 +83,7 @@ class OilMonitorPanel extends HTMLElement {
       "depth_entity", "timestamp_entity", "outdoor_entity", "indoor_entity",
       "runtime_entity", "target_entity", "litres_entity", "weekly_entity",
       "lower_entity", "upper_entity", "stale_entity", "offset_entity",
-      "reorder_entity", "empty_entity",
+      "reorder_entity", "empty_entity", "reorder_level_entity", "empty_level_entity",
     ]
       .map((key) => config[key])
       .filter(Boolean);
@@ -136,6 +136,88 @@ class OilMonitorPanel extends HTMLElement {
     }
     const day = new Intl.DateTimeFormat(language, { weekday: "short", day: "numeric", month: "short", timeZone }).format(date);
     return `Measured ${day} at ${time}`;
+  }
+
+  _levelSetting(entityId, label, help) {
+    const state = this._state(entityId);
+    const value = Number(state?.state);
+    const max = Number(state?.attributes?.max ?? this._panel?.config?.tank_capacity ?? 10000);
+    const control = state
+      ? `<label class="level-input"><input type="number" inputmode="numeric" min="0" max="${max}" step="10" value="${Number.isFinite(value) ? value : ""}" data-level-entity="${this._escape(entityId)}" aria-label="${this._escape(label)} in litres"><span>L</span></label>`
+      : `<div class="hint">Setting not found</div>`;
+    return `<article class="card setting"><div class="metric-label">${this._escape(label)}</div>${control}<div class="hint">${this._escape(help)}</div></article>`;
+  }
+
+  async _setNumber(entityId, value) {
+    if (!entityId || !Number.isFinite(value)) return;
+    try {
+      await this._hass.callService("number", "set_value", { entity_id: entityId, value });
+      this._settingError = null;
+    } catch (error) {
+      this._settingError = error.message || "Could not save the setting.";
+      this._render();
+    }
+  }
+
+  _projectionChart(points, reorderLevel, emptyLevel) {
+    let valid = Array.isArray(points)
+      ? points.filter((point) => Number.isFinite(point.litres) && Number.isFinite(point.cautious) && point.date)
+      : [];
+    // Stop a couple of weeks after the expected level reaches the empty level
+    // (or zero), so the useful part of the projection fills the chart.
+    const floor = Number.isFinite(emptyLevel) ? emptyLevel : 0;
+    const emptyIndex = valid.findIndex((point) => point.litres <= floor);
+    if (emptyIndex > 0) valid = valid.slice(0, Math.min(valid.length, emptyIndex + 5));
+    if (valid.length < 2) {
+      return this._empty("The projection appears once the 7-day estimate is available.");
+    }
+    const width = 900;
+    const height = 260;
+    const left = 52;
+    const right = 20;
+    const top = 16;
+    const bottom = 34;
+    const innerW = width - left - right;
+    const innerH = height - top - bottom;
+    const maxY = Math.max(50, valid[0].litres, Number.isFinite(reorderLevel) ? reorderLevel : 0) * 1.12;
+    const x = (index) => left + (index / (valid.length - 1)) * innerW;
+    const y = (litres) => top + innerH - (Math.max(0, litres) / maxY) * innerH;
+    const line = valid.map((point, index) => `${index ? "L" : "M"}${x(index).toFixed(1)},${y(point.litres).toFixed(1)}`).join(" ");
+    const band = `${valid.map((point, index) => `${index ? "L" : "M"}${x(index).toFixed(1)},${y(point.litres).toFixed(1)}`).join(" ")} ${valid.map((point, index) => [index, point]).reverse().map(([index, point]) => `L${x(index).toFixed(1)},${y(point.cautious).toFixed(1)}`).join(" ")} Z`;
+    const levelLine = (level, cls, label) =>
+      Number.isFinite(level) && level > 0 && level < maxY
+        ? `<line x1="${left}" y1="${y(level)}" x2="${width - right}" y2="${y(level)}" class="${cls}" /><text x="${width - right}" y="${y(level) - 5}" text-anchor="end" class="axis-label">${label} ${this._format(level)} L</text>`
+        : "";
+    const monthFormat = new Intl.DateTimeFormat(this._hass?.locale?.language, { month: "short" });
+    let lastMonth = null;
+    const monthTicks = valid
+      .map((point, index) => {
+        const [year, month, day] = point.date.split("-").map(Number);
+        if (index === 0 || month === lastMonth) {
+          lastMonth = month;
+          return "";
+        }
+        lastMonth = month;
+        return `<line x1="${x(index)}" y1="${top}" x2="${x(index)}" y2="${top + innerH}" class="grid-line" /><text x="${x(index) + 4}" y="${height - 10}" class="axis-label">${monthFormat.format(new Date(year, month - 1, day))}</text>`;
+      })
+      .join("");
+    const hovers = valid
+      .map((point, index) => `<circle cx="${x(index)}" cy="${y(point.litres)}" r="6" class="hover-dot"><title>${this._formatDate(point.date)}: about ${this._format(point.litres)} L (cautious ${this._format(point.cautious)} L)</title></circle>`)
+      .join("");
+    return `<svg viewBox="0 0 ${width} ${height}" role="img" aria-label="Projected oil level over the coming months">
+      <line x1="${left}" y1="${top + innerH}" x2="${width - right}" y2="${top + innerH}" class="axis" />
+      <line x1="${left}" y1="${top}" x2="${left}" y2="${top + innerH}" class="axis" />
+      ${monthTicks}
+      <path d="${band}" class="projection-band" />
+      ${levelLine(reorderLevel, "reorder-line", "Reorder")}
+      ${levelLine(emptyLevel, "empty-line", "Empty")}
+      <path d="${line}" class="oil-line" />
+      ${hovers}
+      <text x="${left}" y="${height - 10}" class="axis-label">Today</text>
+      <text x="${left - 8}" y="${y(maxY / 1.12) + 4}" text-anchor="end" class="axis-label">${this._format(maxY / 1.12)}</text>
+      <text x="${left - 8}" y="${top + innerH + 4}" text-anchor="end" class="axis-label">0</text>
+      <text x="8" y="${top + 8}" class="axis-label">L</text>
+    </svg>`;
   }
 
   _formatDate(isoDate) {
@@ -453,6 +535,12 @@ class OilMonitorPanel extends HTMLElement {
 
   _render() {
     if (!this.shadowRoot || !this._hass || !this._panel) return;
+    // Don't replace an input the user is typing in; redraw once they leave it.
+    if (this._editing) {
+      this._renderPending = true;
+      return;
+    }
+    this._renderPending = false;
     const config = this._panel.config || {};
     const litresId = this._findEntity(config.litres_entity, "litres remaining");
     const weeklyId = this._findEntity(config.weekly_entity, "oil use next 7 days");
@@ -504,33 +592,74 @@ class OilMonitorPanel extends HTMLElement {
       ? this._hass.config.unit_system?.temperature || "°C"
       : target?.attributes?.unit_of_measurement || "°C";
     const offset = Number(this._state(config.offset_entity)?.state);
-    const offsetNote = Number.isFinite(offset) && offset !== 0
-      ? ` · assumes ${offset > 0 ? "+" : ""}${this._format(offset, 1)} °C indoors`
-      : "";
+    const reorderState = this._state(this._findEntity(config.reorder_entity, "days until reorder"));
+    const emptyState = this._state(this._findEntity(config.empty_entity, "days until empty"));
+    const targetNumber = Number(targetValue);
+    const offsetValue = Number.isFinite(offset) ? offset : 0;
+    const assumedIndoor = Number.isFinite(targetNumber) ? targetNumber + offsetValue : null;
+    const assumedHint = !Number.isFinite(targetNumber)
+      ? "Thermostat target not available"
+      : offsetValue
+        ? `Thermostat ${this._format(targetNumber, 1)} ${targetUnit} ${offsetValue > 0 ? "+" : "−"} ${this._format(Math.abs(offsetValue), 1)} °C adjustment`
+        : "Your current thermostat setting";
     const runtimeValue =runtime && runtime.state !== "unknown" && runtime.state !== "unavailable" ? `${this._format(runtime.state, 1)} ${runtime.attributes.unit_of_measurement || "h"}` : "—";
 
     this.shadowRoot.innerHTML = `
       <style>
         :host{display:block;color:var(--primary-text-color);background:var(--primary-background-color);min-height:100%;font-family:var(--paper-font-body1_-_font-family,Roboto,"Noto",sans-serif)}
-        *{box-sizing:border-box}.page{max-width:1180px;margin:0 auto;padding:28px 24px 48px}.top{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;margin-bottom:22px}.eyebrow{color:var(--secondary-text-color);font-size:12px;letter-spacing:.11em;text-transform:uppercase}.title{font-size:clamp(28px,4vw,38px);font-weight:650;margin:5px 0}.subtitle{color:var(--secondary-text-color);margin:0}.grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}.card{background:var(--card-background-color,var(--secondary-background-color));border:1px solid var(--divider-color);border-radius:16px;padding:18px;min-width:0}.metric-label{color:var(--secondary-text-color);font-size:13px}.metric{font-size:clamp(26px,3vw,34px);font-weight:650;margin:8px 0 3px}.unit{font-size:15px;font-weight:450;color:var(--secondary-text-color)}.hint{color:var(--secondary-text-color);font-size:12px}.level{height:6px;border-radius:6px;background:var(--divider-color);margin-top:14px;overflow:hidden}.level i{display:block;height:100%;background:var(--accent-color,#03a9f4);border-radius:inherit}.status{margin:14px 0;padding:12px 14px;border-radius:12px;background:var(--secondary-background-color);font-size:13px}.warn{color:var(--warning-color,#e6a700)}.section{margin-top:18px}.section h2{font-size:18px;margin:0 0 4px}.section p{color:var(--secondary-text-color);margin:0 0 12px;font-size:13px}.charts{display:grid;grid-template-columns:1.35fr 1fr;gap:14px}.chart-card{background:var(--card-background-color,var(--secondary-background-color));border:1px solid var(--divider-color);border-radius:16px;padding:18px;min-width:0}.chart-card h3{margin:0;font-size:16px}.chart-card p{margin:5px 0 12px;color:var(--secondary-text-color);font-size:12px}svg{display:block;width:100%;height:auto;overflow:visible}.axis{stroke:var(--divider-color);stroke-width:1}.axis-label{fill:var(--secondary-text-color);font-size:11px}.oil-line{fill:none;stroke:var(--accent-color,#03a9f4);stroke-width:3}.temp-line{fill:none;stroke:var(--orange-color,#ff9800);stroke-width:2.4;stroke-dasharray:6 4}.oil-bar{fill:var(--accent-color,#03a9f4);opacity:.2}.temp-dot{fill:var(--orange-color,#ff9800)}.scatter-dot{fill:var(--accent-color,#03a9f4);opacity:.75}.trend-line{fill:none;stroke:var(--orange-color,#ff9800);stroke-width:2;stroke-dasharray:5 4}.knee-line{stroke:var(--divider-color);stroke-width:1;stroke-dasharray:2 3}.legend{display:flex;gap:16px;flex-wrap:wrap;font-size:12px;color:var(--secondary-text-color);margin-top:8px}.key{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:6px;background:var(--accent-color,#03a9f4)}.key.temp{background:var(--orange-color,#ff9800)}.toolbar{display:flex;align-items:center;gap:8px}.toolbar select,.toolbar button{color:var(--primary-text-color);background:var(--card-background-color,var(--secondary-background-color));border:1px solid var(--divider-color);border-radius:9px;padding:9px 11px;font:inherit}.empty{padding:24px 8px;color:var(--secondary-text-color);font-size:13px}.details{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.detail{padding:13px;background:var(--secondary-background-color);border-radius:12px}.detail b{display:block;font-size:18px;margin-top:5px}.foot{margin-top:16px;color:var(--secondary-text-color);font-size:12px;line-height:1.5}@media(max-width:850px){.grid{grid-template-columns:repeat(2,minmax(0,1fr))}.charts{grid-template-columns:1fr}}@media(max-width:520px){.page{padding:20px 14px 36px}.grid{gap:9px}.card{padding:14px}.metric{font-size:25px}.details{grid-template-columns:repeat(2,1fr)}.top{align-items:center}}
+        *{box-sizing:border-box}.page{max-width:1180px;margin:0 auto;padding:28px 24px 48px}.top{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;margin-bottom:22px}.eyebrow{color:var(--secondary-text-color);font-size:12px;letter-spacing:.11em;text-transform:uppercase}.title{font-size:clamp(28px,4vw,38px);font-weight:650;margin:5px 0}.subtitle{color:var(--secondary-text-color);margin:0}.grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}.card{background:var(--card-background-color,var(--secondary-background-color));border:1px solid var(--divider-color);border-radius:16px;padding:18px;min-width:0}.metric-label{color:var(--secondary-text-color);font-size:13px}.metric{font-size:clamp(26px,3vw,34px);font-weight:650;margin:8px 0 3px}.unit{font-size:15px;font-weight:450;color:var(--secondary-text-color)}.hint{color:var(--secondary-text-color);font-size:12px}.level{height:6px;border-radius:6px;background:var(--divider-color);margin-top:14px;overflow:hidden}.level i{display:block;height:100%;background:var(--accent-color,#03a9f4);border-radius:inherit}.status{margin:14px 0;padding:12px 14px;border-radius:12px;background:var(--secondary-background-color);font-size:13px}.warn{color:var(--warning-color,#e6a700)}.section{margin-top:18px}.section h2{font-size:18px;margin:0 0 4px}.section p{color:var(--secondary-text-color);margin:0 0 12px;font-size:13px}.charts{display:grid;grid-template-columns:1.35fr 1fr;gap:14px}.chart-card{background:var(--card-background-color,var(--secondary-background-color));border:1px solid var(--divider-color);border-radius:16px;padding:18px;min-width:0}.chart-card h3{margin:0;font-size:16px}.chart-card p{margin:5px 0 12px;color:var(--secondary-text-color);font-size:12px}svg{display:block;width:100%;height:auto;overflow:visible}.axis{stroke:var(--divider-color);stroke-width:1}.axis-label{fill:var(--secondary-text-color);font-size:11px}.oil-line{fill:none;stroke:var(--accent-color,#03a9f4);stroke-width:3}.temp-line{fill:none;stroke:var(--orange-color,#ff9800);stroke-width:2.4;stroke-dasharray:6 4}.oil-bar{fill:var(--accent-color,#03a9f4);opacity:.2}.temp-dot{fill:var(--orange-color,#ff9800)}.scatter-dot{fill:var(--accent-color,#03a9f4);opacity:.75}.trend-line{fill:none;stroke:var(--orange-color,#ff9800);stroke-width:2;stroke-dasharray:5 4}.knee-line{stroke:var(--divider-color);stroke-width:1;stroke-dasharray:2 3}.legend{display:flex;gap:16px;flex-wrap:wrap;font-size:12px;color:var(--secondary-text-color);margin-top:8px}.key{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:6px;background:var(--accent-color,#03a9f4)}.key.temp{background:var(--orange-color,#ff9800)}.toolbar{display:flex;align-items:center;gap:8px}.toolbar select,.toolbar button{color:var(--primary-text-color);background:var(--card-background-color,var(--secondary-background-color));border:1px solid var(--divider-color);border-radius:9px;padding:9px 11px;font:inherit}.empty{padding:24px 8px;color:var(--secondary-text-color);font-size:13px}.details{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.detail{padding:13px;background:var(--secondary-background-color);border-radius:12px}.detail b{display:block;font-size:18px;margin-top:5px}.grid.three{grid-template-columns:repeat(3,minmax(0,1fr))}.chart-card.wide{margin-top:14px}.setting .hint{margin-top:8px;line-height:1.4}.level-input{display:flex;align-items:center;gap:8px;margin:10px 0 2px;font-size:15px;color:var(--secondary-text-color)}.level-input input{width:7.5em;font:inherit;font-size:22px;font-weight:600;color:var(--primary-text-color);background:var(--secondary-background-color);border:1px solid var(--divider-color);border-radius:9px;padding:6px 10px}.stepper{display:flex;align-items:center;gap:12px;margin:10px 0 2px}.stepper b{font-size:22px;min-width:4.5em;text-align:center}.stepper button{width:40px;height:40px;border-radius:50%;font-size:20px;line-height:1;cursor:pointer;color:var(--primary-text-color);background:var(--secondary-background-color);border:1px solid var(--divider-color)}.projection-band{fill:var(--accent-color,#03a9f4);opacity:.15}.reorder-line{stroke:var(--warning-color,#e6a700);stroke-width:1.5;stroke-dasharray:6 4}.empty-line{stroke:var(--error-color,#db4437);stroke-width:1.5;stroke-dasharray:6 4}.grid-line{stroke:var(--divider-color);stroke-width:1;opacity:.5}.hover-dot{fill:transparent}.key.band{background:var(--accent-color,#03a9f4);opacity:.3}.key.reorder{background:var(--warning-color,#e6a700)}.key.stop{background:var(--error-color,#db4437)}.foot{margin-top:16px;color:var(--secondary-text-color);font-size:12px;line-height:1.5}@media(max-width:850px){.grid,.grid.three{grid-template-columns:repeat(2,minmax(0,1fr))}.charts{grid-template-columns:1fr}}@media(max-width:520px){.grid.three{grid-template-columns:1fr}.page{padding:20px 14px 36px}.grid{gap:9px}.card{padding:14px}.metric{font-size:25px}.details{grid-template-columns:repeat(2,1fr)}.top{align-items:center}}
       </style>
       <main class="page">
         <header class="top"><div><div class="eyebrow">Home energy · heating oil</div><h1 class="title">Oil Monitor</h1><p class="subtitle">Your tank, usage trends and weather-aware outlook</p></div><div class="toolbar"><button type="button" class="refresh" title="Refresh history">↻</button></div></header>
-        <section class="grid" aria-label="Oil summary">
+        <section class="section"><h2>Right now</h2><p>Measured by your sensors.</p><div class="grid">
           <article class="card"><div class="metric-label">${stale ? "Last known oil remaining" : "Oil remaining"}</div><div class="metric">${this._format(litres)} <span class="unit">L</span></div><div class="hint">${usingDepthFallback ? `Calculated from ${this._format(depthCm, 0)} cm depth` : "of " + this._format(capacity) + " L usable capacity"}</div><div class="level"><i style="width:${percent}%"></i></div></article>
-          <article class="card"><div class="metric-label">Estimated use · next 7 days</div><div class="metric">${this._format(weekly)} <span class="unit">L</span></div><div class="hint">${estimateHint}${hasEstimate ? offsetNote : ""}</div></article>
-          ${this._runOutCard(this._state(this._findEntity(config.reorder_entity, "days until reorder")), this._state(this._findEntity(config.empty_entity, "days until empty")))}
-          <article class="card"><div class="metric-label">Tank reading</div><div class="metric ${stale ? "warn" : ""}">${stale ? "Check sensor" : "Current"}</div><div class="hint" title="${this._escape(timestamp?.state || "")}">${this._escape(this._friendlySampleTime(timestamp?.state))}</div></article>
-        </section>
-        <div class="status ${stale ? "warn" : ""}">${status}${this._loading ? " Loading recorder history…" : ""}${this._error ? ` History: ${this._escape(this._error)}` : ""}</div>
-        <section class="section"><h2>Usage and weather over time</h2><p>Weekly tank-level changes are converted with your tank calibration and compared with weekly outdoor temperatures. Refill and suspect weeks are excluded.</p><div class="charts">
+          <article class="card"><div class="metric-label">Tank reading</div><div class="metric ${stale ? "warn" : ""}">${stale ? "Check sensor" : "Up to date"}</div><div class="hint" title="${this._escape(timestamp?.state || "")}">${this._escape(this._friendlySampleTime(timestamp?.state))}</div></article>
+          <article class="card"><div class="metric-label">Indoor temperature</div><div class="metric">${this._format(indoor?.state, 1)} <span class="unit">${indoor?.attributes?.unit_of_measurement || "°C"}</span></div><div class="hint">Thermostat set to ${this._format(targetValue, 1)} ${targetUnit}</div></article>
+          <article class="card"><div class="metric-label">Outdoor temperature</div><div class="metric">${this._format(outdoor?.state, 1)} <span class="unit">${outdoor?.attributes?.unit_of_measurement || "°C"}</span></div><div class="hint">Heating ran ${runtimeValue} today</div></article>
+        </div>
+        <div class="status ${stale ? "warn" : ""}">${status}${this._loading ? " Loading recorder history…" : ""}${this._error ? ` History: ${this._escape(this._error)}` : ""}${this._settingError ? ` Settings: ${this._escape(this._settingError)}` : ""}</div></section>
+
+        <section class="section"><h2>Estimates</h2><p>Predicted from your history and the weather forecast.</p><div class="grid three">
+          ${this._runOutCard(reorderState, emptyState)}
+          <article class="card"><div class="metric-label">Estimated use · next 7 days</div><div class="metric">${this._format(weekly)} <span class="unit">L</span></div><div class="hint">${estimateHint}</div></article>
+          <article class="card"><div class="metric-label">Estimates assume indoors</div><div class="metric">${this._format(assumedIndoor, 1)} <span class="unit">${targetUnit}</span></div><div class="hint">${assumedHint}</div></article>
+        </div>
+        <article class="chart-card wide"><h3>Projected oil level</h3><p>Expected litres over the coming months. The shaded band runs down to a cautious estimate using the high end of the usage range.</p>${this._projectionChart(emptyState?.attributes?.projection, Number(reorderState?.attributes?.level_litres), Number(emptyState?.attributes?.level_litres))}<div class="legend"><span><i class="key"></i>Expected level</span><span><i class="key band"></i>Cautious range</span><span><i class="key reorder"></i>Reorder level</span><span><i class="key stop"></i>Empty level</span></div></article>
+        <p class="foot">Estimates are learned from your tank, temperature and heating history. The first week follows the weather forecast; later weeks assume temperatures like the same time last year. Use them as a planning aid, not as the only basis for ordering oil.</p></section>
+
+        <section class="section"><h2>Settings</h2><p>Changes apply to the estimates straight away.</p><div class="grid three">
+          ${this._levelSetting(config.reorder_level_entity, "Reorder level", "Order more oil when the tank reaches this level.")}
+          ${this._levelSetting(config.empty_level_entity, "Empty level", "Treat the tank as empty here (the pump/sludge line).")}
+          <article class="card setting"><div class="metric-label">Forecast temperature adjustment</div><div class="stepper"><button type="button" data-offset-step="-0.5" aria-label="Decrease adjustment">−</button><b>${Number.isFinite(offset) ? `${offset > 0 ? "+" : ""}${this._format(offset, 1)}` : "—"} °C</b><button type="button" data-offset-step="0.5" aria-label="Increase adjustment">+</button></div><div class="hint">"What if" the house were warmer or cooler than the thermostat. Leave at 0 for normal estimates.</div></article>
+        </div></section>
+
+        <section class="section"><h2>History</h2><p>Weekly tank-level changes are converted with your tank calibration and compared with weekly outdoor temperatures. Refill and suspect weeks are excluded.</p><div class="charts">
           <article class="chart-card"><h3>Weekly oil use & outdoor temperature</h3><p>Bars and blue line: litres used · orange: mean outdoor temperature</p>${this._chart(weeks)}<div class="legend"><span><i class="key"></i>Oil use (L/week)</span><span><i class="key temp"></i>Outdoor temperature</span></div></article>
           <article class="chart-card"><h3>Oil use vs outdoor temperature</h3><p>Each point is a clean week. The dashed curve flattens to hot-water-only use above the temperature where heating switches off.</p>${this._scatter(weeks)}</article>
         </div></section>
-        <section class="section"><h2>Home heating conditions</h2><p>Live context from your selected Home Assistant entities.</p><div class="details"><div class="detail"><span class="metric-label">Indoor temperature</span><b>${this._format(indoor?.state, 1)} ${indoor?.attributes?.unit_of_measurement || "°C"}</b></div><div class="detail"><span class="metric-label">Thermostat target</span><b>${this._format(targetValue, 1)} ${targetUnit}</b></div><div class="detail"><span class="metric-label">Heating runtime today</span><b>${runtimeValue}</b></div><div class="detail"><span class="metric-label">Outdoor temperature</span><b>${this._format(outdoor?.state, 1)} ${outdoor?.attributes?.unit_of_measurement || "°C"}</b></div></div></section>
-        <p class="foot">Forecasts are estimates learned from available tank, temperature and heating history. A limited or noisy history can make the range wide or misleading. Use this as a planning aid, not as the only basis for ordering oil.<br>Dashboard build ${this._escape(config.build || "unknown")}</p>
+        <p class="foot">Dashboard build ${this._escape(config.build || "unknown")}</p>
       </main>`;
 
+    this.shadowRoot.querySelectorAll("[data-level-entity]").forEach((input) => {
+      input.addEventListener("focus", () => { this._editing = true; });
+      input.addEventListener("blur", () => {
+        this._editing = false;
+        if (this._renderPending) this._render();
+      });
+      input.addEventListener("change", () => {
+        const max = Number(input.max);
+        const value = Math.min(Number.isFinite(max) ? max : Infinity, Math.max(0, Number(input.value)));
+        this._setNumber(input.dataset.levelEntity, value);
+      });
+      input.addEventListener("keydown", (event) => { if (event.key === "Enter") input.blur(); });
+    });
+    this.shadowRoot.querySelectorAll("[data-offset-step]").forEach((button) => {
+      button.addEventListener("click", () => {
+        const current = Number(this._state(config.offset_entity)?.state) || 0;
+        const next = Math.min(3, Math.max(-3, current + Number(button.dataset.offsetStep)));
+        this._setNumber(config.offset_entity, next);
+      });
+    });
     this.shadowRoot.querySelector(".refresh")?.addEventListener("click", () => {
       this._lastFetch = 0;
       this._loadStatistics();

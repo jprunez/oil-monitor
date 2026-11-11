@@ -130,6 +130,8 @@ class OilRunOutSensor(CoordinatorEntity[OilPredictCoordinator], SensorEntity):
     _attr_has_entity_name = True
     _attr_native_unit_of_measurement = "d"
     _attr_suggested_display_precision = 0
+    # The chart series changes every update; keep it out of the recorder.
+    _unrecorded_attributes = frozenset({"projection"})
 
     def __init__(
         self,
@@ -165,10 +167,13 @@ class OilRunOutSensor(CoordinatorEntity[OilPredictCoordinator], SensorEntity):
     def extra_state_attributes(self) -> dict[str, Any]:
         """Expose the expected date, a cautious earliest date, and the level."""
         projection = self.coordinator.data[self._level]
-        return {
+        attributes: dict[str, Any] = {
             "date": projection["date"],
             "earliest_days": projection["earliest_days"],
             "earliest_date": projection["earliest_date"],
             "level_litres": projection["level_litres"],
             "more_than_a_year": projection["beyond_horizon"],
         }
+        if self._level == "empty":
+            attributes["projection"] = self.coordinator.data["level_projection"]
+        return attributes
