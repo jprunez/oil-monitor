@@ -36,3 +36,21 @@ def mock_panel(recorder_mock, hass):
         patch("custom_components.oil_predict.frontend", MagicMock()),
     ):
         yield register
+
+
+@pytest.fixture(autouse=True)
+def no_weather_history_download():
+    """Never contact the weather-history service from tests."""
+    from custom_components.oil_predict.climate_history import ClimateHistoryError
+
+    with (
+        patch(
+            "custom_components.oil_predict.climate_history.async_fetch_daily_temperatures",
+            AsyncMock(side_effect=ClimateHistoryError("Could not download weather history: offline")),
+        ) as fetch,
+        patch(
+            "custom_components.oil_predict.climate_history.async_geocode",
+            AsyncMock(return_value=(54.0, -1.1, "YO10 area")),
+        ),
+    ):
+        yield fetch

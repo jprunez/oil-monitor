@@ -9,7 +9,7 @@ Oil Monitor tells you how much heating oil is in your tank, how much you are lik
 - **Litres remaining**, from a distance, percent or litres sensor on your tank.
 - **A warning when the tank reading is out of date**, for example when the sensor's battery is flat.
 - **Estimated oil use for the next 7 days**, with a likely range, based on the weather forecast.
-- **How long the oil will last**: days until your reorder level and until empty, with dates and a projected-level chart. The first week follows the weather forecast. Later weeks assume temperatures like the same time last year.
+- **How long the oil will last**: days until your reorder level and until empty, with dates and a projected-level chart for **mild, typical and cold winters**. The first week follows the weather forecast. Later weeks use about 25 years of real temperatures for your area.
 - **History charts** of weekly oil use against outdoor temperature, including the temperature at which your heating switches off.
 - **Settings on the dashboard** for the reorder level, the empty level and a "what if it were warmer or cooler indoors" adjustment.
 
@@ -62,6 +62,11 @@ A distance sensor measures the gap between the sensor and the oil surface. Oil M
 ### 3. Temperatures and weather
 Choose the temperature sensors, thermostat and weather forecast, and optionally the runtime and measurement-time sensors. Set **Warn when the tank reading is older than** a little longer than your sensor's normal reporting interval.
 
+### Winter scenarios and your location
+To project mild, typical and cold winters, Oil Monitor downloads about 25 years of daily temperatures for your area from [Open-Meteo](https://open-meteo.com) (free, no account). You can enter a **town or the first part of your postcode**, or leave it empty to use Home Assistant's home location. Either way, only a location rounded to about 10 km is sent, and for UK postcodes only the first half (e.g. `YO10`) is looked up. The download happens about once a month and is stored in Home Assistant.
+
+You can switch this off in setup. Oil Monitor then stays fully local and bases the scenarios on last year's temperatures, 2 °C warmer and colder.
+
 ### Changing settings later
 Go to **Settings → Devices & services → Oil Monitor → Configure**. The reorder level, empty level and temperature adjustment are also on the Oil Monitor dashboard under **Settings**.
 
@@ -72,7 +77,7 @@ Go to **Settings → Devices & services → Oil Monitor → Configure**. The reo
 | Litres remaining | Current litres, with the raw sensor reading as an attribute. |
 | Tank sensor stale | On when the reading is missing or older than your limit. Its attributes show how many clean weeks of history there are. |
 | Estimated oil use next 7 days, lower and upper estimate | The 7-day estimate and its range. |
-| Days until reorder level, Days until empty | How long the oil will last, with `date` and `earliest_date` attributes. Useful for automations, e.g. a phone notification when reorder is under 7 days away. |
+| Days until reorder level, Days until empty | How long the oil will last in a typical winter, with `date`, `earliest_date` (cold winter) and `latest_date` (mild winter) attributes. Useful for automations, e.g. a phone notification when reorder is under 7 days away. |
 | Reorder level, Empty level, Forecast temperature adjustment | Settings (also on the dashboard). Reorder defaults to 25 % of capacity, empty to 5 %. |
 
 ## Troubleshooting

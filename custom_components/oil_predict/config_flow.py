@@ -20,6 +20,7 @@ from .const import (
     CONF_DEPTH_ENTITY,
     CONF_EMPTY_DISTANCE,
     CONF_FULL_DISTANCE,
+    CONF_HISTORY_LOCATION,
     CONF_INDOOR_ENTITY,
     CONF_INDOOR_TARGET_ENTITY,
     CONF_LEVEL_TYPE,
@@ -31,6 +32,7 @@ from .const import (
     CONF_TANK_TEMP_ENTITY,
     CONF_TIMESTAMP_ENTITY,
     CONF_WEATHER_ENTITY,
+    CONF_WEATHER_HISTORY,
     DEFAULT_EMPTY_DISTANCE,
     DEFAULT_FULL_DISTANCE,
     DEFAULT_STALE_AFTER_MINUTES,
@@ -49,7 +51,12 @@ from .model import (
     parse_calibration,
 )
 
-OPTIONAL_ENTITIES = (CONF_RUNTIME_ENTITY, CONF_TIMESTAMP_ENTITY, CONF_TANK_TEMP_ENTITY)
+OPTIONAL_ENTITIES = (
+    CONF_RUNTIME_ENTITY,
+    CONF_TIMESTAMP_ENTITY,
+    CONF_TANK_TEMP_ENTITY,
+    CONF_HISTORY_LOCATION,
+)
 
 
 def _distance_selector() -> selector.NumberSelector:
@@ -110,6 +117,8 @@ SENSORS_SCHEMA = vol.Schema(
         vol.Optional(CONF_RUNTIME_ENTITY): _sensor(),
         vol.Optional(CONF_TIMESTAMP_ENTITY): _sensor(),
         vol.Optional(CONF_TANK_TEMP_ENTITY): _sensor(),
+        vol.Required(CONF_WEATHER_HISTORY, default=True): selector.BooleanSelector(),
+        vol.Optional(CONF_HISTORY_LOCATION): selector.TextSelector(),
         vol.Required(
             CONF_STALE_AFTER_MINUTES, default=DEFAULT_STALE_AFTER_MINUTES
         ): selector.NumberSelector(

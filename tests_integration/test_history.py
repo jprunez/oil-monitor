@@ -44,7 +44,11 @@ def _hours():
 
 
 async def _record_history(
-    hass: HomeAssistant, *, runtime_as_total: bool, indoor: bool = True
+    hass: HomeAssistant,
+    *,
+    runtime_as_total: bool,
+    indoor: bool = True,
+    weather_driven: bool = False,
 ) -> None:
     """Record ~4 months of hourly statistics: steady use, cold weather."""
     hours = _hours()
@@ -57,12 +61,23 @@ async def _record_history(
             rows.append({"start": hour, "mean": value, "min": value, "max": value})
         return rows
 
-    # Distance to the oil grows 0.4 cm/day as oil is used.
+    def outdoor_at(d: float) -> float:
+        return 4 + 4 * ((d // 7) % 3)
+
+    def hours_at(d: float) -> float:
+        # Heating hours per day: fixed, or more in colder weeks.
+        return 0.4 * (19.5 - outdoor_at(d)) if weather_driven else 4.0
+
+    # Distance to the oil grows about 0.1 cm per heating hour as oil is used.
+    depth_rows = []
+    depth = 20.0
+    for hour in hours:
+        d = (hour - first).total_seconds() / 86400
+        depth += 0.1 * hours_at(d) / 24
+        depth_rows.append({"start": hour, "mean": depth, "min": depth, "max": depth})
+    async_import_statistics(hass, _metadata("sensor.tank_depth", "cm", mean=True), depth_rows)
     async_import_statistics(
-        hass, _metadata("sensor.tank_depth", "cm", mean=True), series(lambda d: 20 + 0.4 * d)
-    )
-    async_import_statistics(
-        hass, _metadata("sensor.outdoor", "°C", mean=True), series(lambda d: 4 + 4 * ((d // 7) % 3))
+        hass, _metadata("sensor.outdoor", "°C", mean=True), series(outdoor_at)
     )
     if indoor:
         async_import_statistics(
@@ -81,7 +96,7 @@ async def _record_history(
         async_import_statistics(
             hass,
             _metadata("sensor.runtime", "h", mean=True),
-            series(lambda d: 4 * (d % 1)),
+            series(lambda d: hours_at(d) * (d % 1)),
         )
     await async_wait_recording_done(hass)
 
@@ -307,3 +322,100 @@ async def test_ultrasonic_temperature_correction(
         registry.async_get_entity_id("sensor", DOMAIN, f"{entry.entry_id}_litres_remaining")
     )
     assert float(litres.state) == pytest.approx(reading_to_litres(reading, tank), abs=0.01)
+
+
+
+def _register_weather(hass: HomeAssistant) -> None:
+    """Provide a weather.get_forecasts service returning seven cold days."""
+    from homeassistant.core import SupportsResponse
+
+    async def get_forecasts(call):
+        return {
+            "weather.home": {
+                "forecast": [{"temperature": 7.0, "templow": 1.0} for _ in range(8)]
+            }
+        }
+
+    hass.services.async_register(
+        "weather", "get_forecasts", get_forecasts, supports_response=SupportsResponse.ONLY
+    )
+
+
+@pytest.mark.parametrize("download_works", [True, False])
+async def test_winter_scenarios(
+    hass: HomeAssistant, hass_storage, no_weather_history_download, download_works: bool
+) -> None:
+    """Run-out dates are given for cold, typical and mild winters."""
+    from datetime import date
+
+    if download_works:
+        # 20 years of archive: each year uniformly warmer or colder than 6 °C.
+        today = dt_util.now().date()
+        archive = {}
+        day = date(today.year - 20, 1, 1)
+        while day < today - timedelta(days=7):
+            archive[day] = 6.0 + ((day.year * 7) % 9 - 4)
+            day += timedelta(days=1)
+        no_weather_history_download.side_effect = None
+        no_weather_history_download.return_value = archive
+
+    await _record_history(hass, runtime_as_total=False, weather_driven=True)
+    _register_weather(hass)
+    hass.states.async_set("sensor.tank_depth", "60", {"unit_of_measurement": "cm", "state_class": "measurement"})
+    hass.states.async_set("sensor.outdoor", "6", {"unit_of_measurement": "°C", "state_class": "measurement"})
+    hass.states.async_set("sensor.indoor", "19.5", {"unit_of_measurement": "°C", "state_class": "measurement"})
+    hass.states.async_set("sensor.runtime", "2", {"unit_of_measurement": "h", "state_class": "measurement"})
+    hass.states.async_set("climate.home", "heat", {"temperature": 19})
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        version=2,
+        unique_id=DOMAIN,
+        data={
+            "depth_entity": "sensor.tank_depth",
+            "level_type": "distance",
+            "tank_capacity": 1000,
+            "tank_shape": "vertical",
+            "full_distance_cm": 10,
+            "empty_distance_cm": 130,
+            "outdoor_entity": "sensor.outdoor",
+            "indoor_entity": "sensor.indoor",
+            "indoor_target_entity": "climate.home",
+            "weather_entity": "weather.home",
+            "runtime_entity": "sensor.runtime",
+            "history_location": "YO10 5DD",
+            "stale_after_minutes": 90,
+        },
+    )
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    registry = er.async_get(hass)
+
+    def state(platform: str, key: str):
+        return hass.states.get(
+            registry.async_get_entity_id(platform, DOMAIN, f"{entry.entry_id}_{key}")
+        )
+
+    stale = state("binary_sensor", "tank_sensor_stale")
+    assert stale.attributes["forecast_warning"] is None, stale.attributes
+    info = stale.attributes["scenario_info"]
+    rows = {row["role"]: row for row in stale.attributes["setup_check"]}
+    if download_works:
+        assert info["source"] == "weather_history"
+        assert info["years"] >= 15
+        assert (info["latitude"], info["longitude"]) == (54.0, -1.1)
+        assert rows["scenarios"]["status"] == "ok"
+        assert "YO10 area" in rows["scenarios"]["message"]
+    else:
+        assert info["source"] == "last_year_shifted"
+        assert rows["scenarios"]["status"] == "warning"
+        assert "offline" in rows["scenarios"]["message"]
+
+    empty = state("sensor", "days_until_empty")
+    typical = float(empty.state)
+    assert empty.attributes["earliest_days"] < typical < empty.attributes["latest_days"]
+    assert empty.attributes["earliest_date"] <= empty.attributes["date"] <= empty.attributes["latest_date"]
+    point = empty.attributes["projection"][-1]
+    assert point["cold"] <= point["litres"] <= point["mild"]
+    assert set(point) == {"date", "litres", "mild", "cold"}

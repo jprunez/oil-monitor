@@ -29,6 +29,9 @@ seasonal_outdoor_c = MODEL["seasonal_outdoor_c"]
 days_until_level = MODEL["days_until_level"]
 MIN_TRAINING_WEEKS = MODEL["MIN_TRAINING_WEEKS"]
 estimate_temperature_drift = MODEL["estimate_temperature_drift"]
+climate_offset = MODEL["climate_offset"]
+historical_year_temperatures = MODEL["historical_year_temperatures"]
+pick_scenarios = MODEL["pick_scenarios"]
 temperature_corrected_distance = MODEL["temperature_corrected_distance"]
 
 
@@ -359,6 +362,52 @@ class TestTemperatureDrift(unittest.TestCase):
             temperature_corrected_distance(cold_reading, 0.0, 15.0), true_distance
         )
         self.assertAlmostEqual(temperature_corrected_distance(60.0, 15.0, 15.0), 60.0)
+
+
+
+class TestWinterScenarios(unittest.TestCase):
+    """Verify mild/typical/cold scenarios from long-term weather history."""
+
+    def _archive(self) -> dict:
+        # Ten years; year k is uniformly (k - 4.5) degrees off a 5 degree winter.
+        archive = {}
+        day = date(2016, 1, 1)
+        while day < date(2026, 1, 1):
+            archive[day] = 5.0 + (day.year - 2016 - 4.5)
+            day += timedelta(days=1)
+        return archive
+
+    def test_offset_matches_archive_to_local_sensor(self) -> None:
+        """The archive is shifted to agree with the user's own sensor."""
+        archive = self._archive()
+        local = {day: temp + 1.5 for day, temp in archive.items() if day.year == 2025}
+        self.assertAlmostEqual(climate_offset(local, archive), 1.5)
+        self.assertEqual(climate_offset({date(2025, 1, 1): 9.0}, archive), 0.0)
+
+    def test_one_temperature_series_per_past_year(self) -> None:
+        """Each complete past year contributes the same calendar days."""
+        years = historical_year_temperatures(self._archive(), date(2026, 1, 10), 60)
+        self.assertEqual(len(years), 10)
+        self.assertTrue(all(len(year) == 60 for year in years))
+        self.assertEqual(years[0][0], 5.0 + 4.5)  # one year back is 2025
+        self.assertEqual(years[-1][0], 5.0 - 4.5)  # ten years back is 2016
+
+    def test_incomplete_years_are_left_out(self) -> None:
+        """A year with a long gap is not used."""
+        archive = self._archive()
+        for offset in range(30):
+            archive.pop(date(2020, 1, 15) + timedelta(days=offset))
+        years = historical_year_temperatures(archive, date(2026, 1, 10), 60)
+        self.assertEqual(len(years), 9)
+
+    def test_scenarios_order_mild_typical_cold(self) -> None:
+        """Cold uses more than typical, which uses more than mild."""
+        yearly = [[10.0 + year] * 200 for year in range(10)]
+        typical, mild, cold = pick_scenarios(yearly)
+        self.assertAlmostEqual(typical[0], 14.5)
+        self.assertEqual(mild[0], 11.0)  # 10th percentile year
+        self.assertEqual(cold[0], 18.0)  # 90th percentile year
+        self.assertIsNone(pick_scenarios(yearly[:4]))
 
 
 if __name__ == "__main__":

@@ -42,7 +42,9 @@
           "runtime_entity": "Daily heating runtime sensor (optional)",
           "timestamp_entity": "Tank measurement time sensor (optional)",
           "stale_after_minutes": "Warn when the tank reading is older than (minutes)",
-          "tank_temp_entity": "Tank temperature sensor (optional)"
+          "tank_temp_entity": "Tank temperature sensor (optional)",
+          "weather_history": "Use long-term weather history for winter scenarios",
+          "history_location": "Town or postcode for weather history (optional)"
         },
         "data_description": {
           "outdoor_entity": "A temperature sensor with long-term statistics, in °C or °F.",
@@ -52,7 +54,9 @@
           "runtime_entity": "Hours the heating has run today, resetting daily. Improves accuracy; leave empty if you don't have one.",
           "timestamp_entity": "When the tank sensor actually took its reading. Useful for radio/MQTT sensors with retained messages; leave empty to use the time Home Assistant received the reading.",
           "stale_after_minutes": "Set this a little longer than your sensor's normal reporting interval.",
-          "tank_temp_entity": "Air temperature at the tank sensor. Ultrasonic sensors read slightly long in cold air; Oil Monitor checks your history for this and corrects it if needed. Leave empty to use the outdoor temperature."
+          "tank_temp_entity": "Air temperature at the tank sensor. Ultrasonic sensors read slightly long in cold air; Oil Monitor checks your history for this and corrects it if needed. Leave empty to use the outdoor temperature.",
+          "weather_history": "Downloads about 25 years of daily temperatures for your area from Open-Meteo (free, no account) to project mild, typical and cold winters. Only an approximate location, rounded to about 10 km, is sent. Turn off to keep everything local.",
+          "history_location": "A town, or the first part of your postcode (e.g. YO10). Leave empty to use Home Assistant's home location. Either way it is rounded to about 10 km."
         }
       }
     },
@@ -108,7 +112,9 @@
           "runtime_entity": "Daily heating runtime sensor (optional)",
           "timestamp_entity": "Tank measurement time sensor (optional)",
           "stale_after_minutes": "Warn when the tank reading is older than (minutes)",
-          "tank_temp_entity": "Tank temperature sensor (optional)"
+          "tank_temp_entity": "Tank temperature sensor (optional)",
+          "weather_history": "Use long-term weather history for winter scenarios",
+          "history_location": "Town or postcode for weather history (optional)"
         },
         "data_description": {
           "outdoor_entity": "A temperature sensor with long-term statistics, in °C or °F.",
@@ -118,7 +124,9 @@
           "runtime_entity": "Hours the heating has run today, resetting daily. Improves accuracy; leave empty if you don't have one.",
           "timestamp_entity": "When the tank sensor actually took its reading. Useful for radio/MQTT sensors with retained messages; leave empty to use the time Home Assistant received the reading.",
           "stale_after_minutes": "Set this a little longer than your sensor's normal reporting interval.",
-          "tank_temp_entity": "Air temperature at the tank sensor. Ultrasonic sensors read slightly long in cold air; Oil Monitor checks your history for this and corrects it if needed. Leave empty to use the outdoor temperature."
+          "tank_temp_entity": "Air temperature at the tank sensor. Ultrasonic sensors read slightly long in cold air; Oil Monitor checks your history for this and corrects it if needed. Leave empty to use the outdoor temperature.",
+          "weather_history": "Downloads about 25 years of daily temperatures for your area from Open-Meteo (free, no account) to project mild, typical and cold winters. Only an approximate location, rounded to about 10 km, is sent. Turn off to keep everything local.",
+          "history_location": "A town, or the first part of your postcode (e.g. YO10). Leave empty to use Home Assistant's home location. Either way it is rounded to about 10 km."
         }
       }
     },

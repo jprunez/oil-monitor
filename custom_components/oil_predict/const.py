@@ -22,6 +22,8 @@ CONF_TANK_TEMP_ENTITY = "tank_temp_entity"  # optional
 CONF_INDOOR_TARGET_ENTITY = "indoor_target_entity"
 CONF_WEATHER_ENTITY = "weather_entity"
 CONF_STALE_AFTER_MINUTES = "stale_after_minutes"
+CONF_WEATHER_HISTORY = "weather_history"  # use long-term weather history
+CONF_HISTORY_LOCATION = "history_location"  # optional town or postcode
 
 DEFAULT_TANK_CAPACITY = 1000
 DEFAULT_STALE_AFTER_MINUTES = 90

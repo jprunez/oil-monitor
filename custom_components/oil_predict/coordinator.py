@@ -27,6 +27,7 @@ from .const import (
     CONF_DEPTH_ENTITY,
     CONF_EMPTY_DISTANCE,
     CONF_FULL_DISTANCE,
+    CONF_HISTORY_LOCATION,
     CONF_INDOOR_ENTITY,
     CONF_INDOOR_TARGET_ENTITY,
     CONF_LEVEL_TYPE,
@@ -38,12 +39,15 @@ from .const import (
     CONF_TANK_TEMP_ENTITY,
     CONF_TIMESTAMP_ENTITY,
     CONF_WEATHER_ENTITY,
+    CONF_WEATHER_HISTORY,
     DOMAIN,
     EMPTY_FRACTION,
     REORDER_FRACTION,
 )
+from .climate_history import ClimateHistoryManager
 from .model import (
     DEPTH_TO_PERCENT,
+    FALLBACK_SCENARIO_SHIFT_C,
     LEVEL_DISTANCE,
     LEVEL_LITRES,
     LEVEL_PERCENT,
@@ -55,10 +59,13 @@ from .model import (
     UsageModel,
     WeeklyForecast,
     build_training_samples,
+    climate_offset,
     days_until_level,
     estimate_temperature_drift,
     fit_usage_model,
+    historical_year_temperatures,
     parse_calibration,
+    pick_scenarios,
     reading_to_litres,
     forecast_week,
     parse_sample_timestamp,
@@ -134,8 +141,14 @@ class OilPredictCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.reorder_level_litres = round(self.tank.capacity_litres * REORDER_FRACTION)
         self.empty_level_litres = round(self.tank.capacity_litres * EMPTY_FRACTION)
         self._outdoor_history: dict[date, float] = {}
-        self._daily_usage_projection: list[float] | None = None
-        self._upper_scale = 1.0
+        # Projected daily litres for a typical, mild and cold winter.
+        self._usage: dict[str, list[float]] | None = None
+        self.scenario_info: dict[str, Any] | None = None
+        self.climate: ClimateHistoryManager | None = (
+            ClimateHistoryManager(hass, entry.data.get(CONF_HISTORY_LOCATION))
+            if entry.data.get(CONF_WEATHER_HISTORY, True)
+            else None
+        )
 
     @property
     def training_samples(self) -> list[DailyTrainingSample]:
@@ -209,7 +222,7 @@ class OilPredictCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     async def _async_update_forecast(self) -> None:
         """Refresh training history when due and recalculate the weekly forecast."""
         self._forecast_needs_retry = False
-        self._daily_usage_projection = None
+        self._usage = None
         try:
             if (
                 self._history_loaded_at is None
@@ -245,12 +258,8 @@ class OilPredictCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._weekly_forecast = forecast_week(
                 model, forecast_temperatures, indoor_target
             )
-            self._daily_usage_projection = self._project_daily_usage(
+            await self._async_build_scenarios(
                 model, forecast_temperatures, indoor_target
-            )
-            total = self._weekly_forecast.total_litres
-            self._upper_scale = (
-                self._weekly_forecast.upper_litres / total if total > 0 else 1.0
             )
             self._forecast_warning = None
         except (HomeAssistantError, ValueError, TypeError, KeyError) as err:
@@ -390,6 +399,40 @@ class OilPredictCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     "history_days": days,
                 }
             )
+        info = self.scenario_info
+        if info is not None:
+            status = "ok"
+            if info["source"] == "weather_history":
+                message = (
+                    f"Using {info['years']} years of weather history for {info['place']} "
+                    "(location rounded to about 10 km)."
+                )
+            elif info.get("error"):
+                status = "warning"
+                message = (
+                    f"{info['error']} Using last year's temperatures, "
+                    f"{info['shift_c']:.0f} °C warmer and colder, instead."
+                )
+            elif info.get("weather_history_enabled"):
+                message = (
+                    "Weather history isn't available yet. Using last year's temperatures, "
+                    f"{info['shift_c']:.0f} °C warmer and colder."
+                )
+            else:
+                message = (
+                    "Weather history is switched off. Using last year's temperatures, "
+                    f"{info['shift_c']:.0f} °C warmer and colder."
+                )
+            rows.append(
+                {
+                    "role": "scenarios",
+                    "label": "Winter scenarios",
+                    "entity_id": "",
+                    "status": status,
+                    "message": message,
+                    "history_days": None,
+                }
+            )
         if self.tank.level_type == LEVEL_DISTANCE:
             correction = self.temp_correction
             if correction["active"]:
@@ -418,86 +461,127 @@ class OilPredictCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             )
         return rows
 
-    def _project_daily_usage(
+    async def _async_build_scenarios(
         self,
-        model: Any,
+        model: UsageModel,
         forecast_temperatures: list[float],
         indoor_target_c: float,
-    ) -> list[float]:
-        """Project daily litres for the coming year.
+    ) -> None:
+        """Project daily litres for a year, for a typical, mild and cold winter.
 
-        The first week uses the weather forecast; later days use the outdoor
-        temperature recorded around the same date last year. Where no history
-        exists, the forecast week's average temperature is assumed.
+        The first week follows the weather forecast in every scenario. With
+        long-term weather history, later days use each past year's
+        temperatures for the same dates: typical is the average across years,
+        mild and cold are real years near the 10th and 90th percentile of oil
+        use. Without it, last year's temperatures are shifted up and down.
         """
-        fallback = sum(forecast_temperatures) / len(forecast_temperatures)
         today = dt_util.now().date()
-        usage: list[float] = []
-        for offset in range(PROJECTION_DAYS):
-            if offset < len(forecast_temperatures):
-                outdoor = forecast_temperatures[offset]
-            else:
-                outdoor = seasonal_outdoor_c(
-                    self._outdoor_history, today + timedelta(days=offset)
-                )
-                if outdoor is None:
-                    outdoor = fallback
-            usage.append(predict_day(model, outdoor, indoor_target_c)[1])
-        return usage
+        week = [predict_day(model, temp, indoor_target_c)[1] for temp in forecast_temperatures]
+        rest_start = today + timedelta(days=len(week))
+        rest_days = PROJECTION_DAYS - len(week)
+
+        history = await self.climate.async_get() if self.climate is not None else None
+        if history is not None:
+            offset = climate_offset(self._outdoor_history, history.daily)
+            years = historical_year_temperatures(history.daily, rest_start, rest_days)
+            picked = pick_scenarios(
+                [
+                    [predict_day(model, temp + offset, indoor_target_c)[1] for temp in year]
+                    for year in years
+                ]
+            )
+            if picked is not None:
+                typical, mild, cold = picked
+                self._usage = {
+                    "typical": week + typical,
+                    "mild": week + mild,
+                    "cold": week + cold,
+                }
+                self.scenario_info = {
+                    "source": "weather_history",
+                    "years": len(years),
+                    "place": history.place,
+                    "latitude": history.latitude,
+                    "longitude": history.longitude,
+                    "offset_c": round(offset, 2),
+                }
+                return
+
+        # Fallback: last year's temperatures (or the forecast week's average
+        # where there is no history), shifted for the mild and cold cases.
+        fallback = sum(forecast_temperatures) / len(forecast_temperatures)
+        temps: list[float] = []
+        for offset_days in range(rest_days):
+            temp = seasonal_outdoor_c(
+                self._outdoor_history, rest_start + timedelta(days=offset_days)
+            )
+            temps.append(fallback if temp is None else temp)
+
+        def usage(shift: float) -> list[float]:
+            return week + [
+                predict_day(model, temp + shift, indoor_target_c)[1] for temp in temps
+            ]
+
+        self._usage = {
+            "typical": usage(0.0),
+            "mild": usage(FALLBACK_SCENARIO_SHIFT_C),
+            "cold": usage(-FALLBACK_SCENARIO_SHIFT_C),
+        }
+        self.scenario_info = {
+            "source": "last_year_shifted",
+            "shift_c": FALLBACK_SCENARIO_SHIFT_C,
+            "weather_history_enabled": self.climate is not None,
+            "error": self.climate.error if self.climate is not None else None,
+        }
 
     def _level_projection(self, litres: float | None) -> list[dict[str, Any]] | None:
-        """Projected litres every few days for about six months, for charting.
-
-        ``litres`` is the central estimate; ``cautious`` uses the upper end of
-        the usage range (the tank empties sooner).
-        """
-        if litres is None or self._daily_usage_projection is None:
+        """Projected litres every few days for about six months, for charting."""
+        if litres is None or self._usage is None:
             return None
         today = dt_util.now().date()
         points: list[dict[str, Any]] = []
-        central = cautious = litres
-        for offset, use in enumerate(self._daily_usage_projection[:PROJECTION_CHART_DAYS + 1]):
+        level = {name: litres for name in self._usage}
+        for offset in range(PROJECTION_CHART_DAYS + 1):
             if offset % PROJECTION_CHART_STEP == 0:
                 points.append(
                     {
                         "date": (today + timedelta(days=offset)).isoformat(),
-                        "litres": round(max(0.0, central), 1),
-                        "cautious": round(max(0.0, cautious), 1),
+                        "litres": round(max(0.0, level["typical"]), 1),
+                        "mild": round(max(0.0, level["mild"]), 1),
+                        "cold": round(max(0.0, level["cold"]), 1),
                     }
                 )
-            central -= use
-            cautious -= use * self._upper_scale
+            for name, usage in self._usage.items():
+                level[name] -= usage[offset]
         return points
 
     def _run_out(self, litres: float | None, level: float) -> dict[str, Any]:
-        """Days and dates until the tank reaches ``level`` (central and earliest)."""
+        """Days and dates until the tank reaches ``level`` in each scenario.
+
+        ``days``/``date`` are for a typical winter, ``earliest_*`` for a cold
+        one and ``latest_*`` for a mild one.
+        """
         result: dict[str, Any] = {
             "days": None,
             "date": None,
             "earliest_days": None,
             "earliest_date": None,
+            "latest_days": None,
+            "latest_date": None,
             "level_litres": level,
             "beyond_horizon": False,
         }
-        if litres is None or self._daily_usage_projection is None:
+        if litres is None or self._usage is None:
             return result
         today = dt_util.now().date()
-        central = days_until_level(litres, level, self._daily_usage_projection)
-        earliest = days_until_level(
-            litres,
-            level,
-            [use * self._upper_scale for use in self._daily_usage_projection],
-        )
-        if central is None:
-            result["beyond_horizon"] = True
-        else:
-            result["days"] = central
-            result["date"] = (today + timedelta(days=int(central))).isoformat()
-        if earliest is not None:
-            result["earliest_days"] = earliest
-            result["earliest_date"] = (
-                today + timedelta(days=int(earliest))
-            ).isoformat()
+        for prefix, scenario in (("", "typical"), ("earliest_", "cold"), ("latest_", "mild")):
+            days = days_until_level(litres, level, self._usage[scenario])
+            if days is None:
+                if scenario == "typical":
+                    result["beyond_horizon"] = True
+                continue
+            result[f"{prefix}days"] = days
+            result[f"{prefix}date"] = (today + timedelta(days=int(days))).isoformat()
         return result
 
     def _forecast_indoor_target(self) -> tuple[float | None, str | None]:
@@ -578,6 +662,7 @@ class OilPredictCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "history_days": dict(self._history_days),
             "indoor_history_fallback_c": self._indoor_fallback_c,
             "temp_correction": dict(self.temp_correction),
+            "scenario_info": dict(self.scenario_info) if self.scenario_info else None,
             "setup_check": self.setup_check(),
             "forecast_warning": self._forecast_warning,
             "temperature_offset_c": self.temperature_offset_c,

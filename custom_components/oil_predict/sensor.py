@@ -174,6 +174,8 @@ class OilRunOutSensor(CoordinatorEntity[OilPredictCoordinator], SensorEntity):
             "date": projection["date"],
             "earliest_days": projection["earliest_days"],
             "earliest_date": projection["earliest_date"],
+            "latest_days": projection["latest_days"],
+            "latest_date": projection["latest_date"],
             "level_litres": projection["level_litres"],
             "more_than_a_year": projection["beyond_horizon"],
         }

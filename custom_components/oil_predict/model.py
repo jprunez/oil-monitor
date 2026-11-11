@@ -690,3 +690,88 @@ def estimate_temperature_drift(
     return DriftEstimate(
         coefficient_per_c=coefficient, t_statistic=t_statistic, day_pairs=n
     )
+
+
+# --- Winter scenarios from long-term weather history --------------------------
+MIN_SCENARIO_YEARS = 5
+MILD_QUANTILE = 0.1
+COLD_QUANTILE = 0.9
+SCENARIO_RANK_DAYS = 182
+FALLBACK_SCENARIO_SHIFT_C = 2.0
+
+
+def _same_day_in_year(day: date, years_back: int) -> date:
+    """The same calendar day ``years_back`` years earlier (29 Feb -> 28 Feb)."""
+    try:
+        return day.replace(year=day.year - years_back)
+    except ValueError:
+        return day.replace(year=day.year - years_back, day=28)
+
+
+def climate_offset(
+    local: Mapping[date, float], archive: Mapping[date, float], min_days: int = 30
+) -> float:
+    """Average difference between the user's outdoor sensor and the archive.
+
+    Added to archive temperatures so they match the user's own sensor.
+    Returns 0 when there are too few overlapping days to tell.
+    """
+    differences = [temp - archive[day] for day, temp in local.items() if day in archive]
+    if len(differences) < min_days:
+        return 0.0
+    return sum(differences) / len(differences)
+
+
+def historical_year_temperatures(
+    archive: Mapping[date, float],
+    start: date,
+    days: int,
+    max_missing_fraction: float = 0.05,
+) -> list[list[float]]:
+    """Daily temperatures for ``start``..``start+days`` as seen in each past year.
+
+    Returns one list per past year that has (nearly) complete data; short
+    gaps are filled with the previous day's value.
+    """
+    if not archive:
+        return []
+    oldest = min(archive)
+    years: list[list[float]] = []
+    back = 1
+    while _same_day_in_year(start, back) >= oldest:
+        temps: list[float] = []
+        missing = 0
+        last: float | None = None
+        for offset in range(days):
+            value = archive.get(_same_day_in_year(start + timedelta(days=offset), back))
+            if value is None:
+                missing += 1
+                value = last
+            if value is None:
+                break
+            temps.append(value)
+            last = value
+        if len(temps) == days and missing <= days * max_missing_fraction:
+            years.append(temps)
+        back += 1
+    return years
+
+
+def pick_scenarios(
+    yearly_usage: Sequence[Sequence[float]], rank_days: int = SCENARIO_RANK_DAYS
+) -> tuple[list[float], list[float], list[float]] | None:
+    """Reduce per-year daily usage to (typical, mild, cold) daily usage.
+
+    Typical is the day-by-day average across years. Mild and cold are the
+    actual years at the 10th and 90th percentile of total use over the first
+    ``rank_days`` days. Returns None with too few years.
+    """
+    if len(yearly_usage) < MIN_SCENARIO_YEARS:
+        return None
+    count = len(yearly_usage)
+    length = min(len(usage) for usage in yearly_usage)
+    typical = [sum(usage[i] for usage in yearly_usage) / count for i in range(length)]
+    ranked = sorted(yearly_usage, key=lambda usage: sum(usage[:rank_days]))
+    mild = list(ranked[round(MILD_QUANTILE * (count - 1))][:length])
+    cold = list(ranked[round(COLD_QUANTILE * (count - 1))][:length])
+    return typical, mild, cold
