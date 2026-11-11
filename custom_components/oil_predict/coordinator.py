@@ -33,19 +33,27 @@ from .const import (
     CONF_TIMESTAMP_ENTITY,
     CONF_WEATHER_ENTITY,
     DOMAIN,
+    EMPTY_LITRES,
+    REORDER_LITRES,
 )
 from .model import (
     DailyHistoryPoint,
     DailyTrainingSample,
     WeeklyForecast,
     build_training_samples,
+    days_until_level,
     depth_to_litres,
     fit_usage_model,
     forecast_week,
     parse_sample_timestamp,
+    predict_day,
+    seasonal_outdoor_c,
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+# How far ahead the run-out projection looks.
+PROJECTION_DAYS = 365
 
 # How often the stale flag is re-evaluated when no new reading arrives.
 STALE_CHECK_INTERVAL = timedelta(minutes=5)
@@ -76,6 +84,11 @@ class OilPredictCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._forecast_warning: str | None = None
         self._forecast_needs_retry = False
         self._target_source: str | None = None
+        self.reorder_level_litres = float(REORDER_LITRES)
+        self.empty_level_litres = float(EMPTY_LITRES)
+        self._outdoor_history: dict[date, float] = {}
+        self._daily_usage_projection: list[float] | None = None
+        self._upper_scale = 1.0
 
     @property
     def device_info(self) -> DeviceInfo:
@@ -106,6 +119,11 @@ class OilPredictCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self.hass, self._async_handle_stale_check, STALE_CHECK_INTERVAL
             ),
         ]
+
+    @callback
+    def async_push_live_data(self) -> None:
+        """Recalculate live values (e.g. after a level setting changes)."""
+        self._async_push_live_data()
 
     @callback
     def _async_push_live_data(self) -> None:
@@ -140,6 +158,7 @@ class OilPredictCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     async def _async_update_forecast(self) -> None:
         """Refresh training history when due and recalculate the weekly forecast."""
         self._forecast_needs_retry = False
+        self._daily_usage_projection = None
         try:
             if (
                 self._history_loaded_at is None
@@ -167,10 +186,16 @@ class OilPredictCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
             model = fit_usage_model(self._training_samples)
             forecast_temperatures = await self._async_get_daily_forecast_c()
+            indoor_target = temperature_target + self.temperature_offset_c
             self._weekly_forecast = forecast_week(
-                model,
-                forecast_temperatures,
-                temperature_target + self.temperature_offset_c,
+                model, forecast_temperatures, indoor_target
+            )
+            self._daily_usage_projection = self._project_daily_usage(
+                model, forecast_temperatures, indoor_target
+            )
+            total = self._weekly_forecast.total_litres
+            self._upper_scale = (
+                self._weekly_forecast.upper_litres / total if total > 0 else 1.0
             )
             self._forecast_warning = None
         except (HomeAssistantError, ValueError, TypeError, KeyError) as err:
@@ -178,6 +203,64 @@ class OilPredictCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._forecast_needs_retry = True
             self._weekly_forecast = None
             self._forecast_warning = str(err)
+
+    def _project_daily_usage(
+        self,
+        model: Any,
+        forecast_temperatures: list[float],
+        indoor_target_c: float,
+    ) -> list[float]:
+        """Project daily litres for the coming year.
+
+        The first week uses the weather forecast; later days use the outdoor
+        temperature recorded around the same date last year. Where no history
+        exists, the forecast week's average temperature is assumed.
+        """
+        fallback = sum(forecast_temperatures) / len(forecast_temperatures)
+        today = dt_util.now().date()
+        usage: list[float] = []
+        for offset in range(PROJECTION_DAYS):
+            if offset < len(forecast_temperatures):
+                outdoor = forecast_temperatures[offset]
+            else:
+                outdoor = seasonal_outdoor_c(
+                    self._outdoor_history, today + timedelta(days=offset)
+                )
+                if outdoor is None:
+                    outdoor = fallback
+            usage.append(predict_day(model, outdoor, indoor_target_c)[1])
+        return usage
+
+    def _run_out(self, litres: float | None, level: float) -> dict[str, Any]:
+        """Days and dates until the tank reaches ``level`` (central and earliest)."""
+        result: dict[str, Any] = {
+            "days": None,
+            "date": None,
+            "earliest_days": None,
+            "earliest_date": None,
+            "level_litres": level,
+            "beyond_horizon": False,
+        }
+        if litres is None or self._daily_usage_projection is None:
+            return result
+        today = dt_util.now().date()
+        central = days_until_level(litres, level, self._daily_usage_projection)
+        earliest = days_until_level(
+            litres,
+            level,
+            [use * self._upper_scale for use in self._daily_usage_projection],
+        )
+        if central is None:
+            result["beyond_horizon"] = True
+        else:
+            result["days"] = central
+            result["date"] = (today + timedelta(days=int(central))).isoformat()
+        if earliest is not None:
+            result["earliest_days"] = earliest
+            result["earliest_date"] = (
+                today + timedelta(days=int(earliest))
+            ).isoformat()
+        return result
 
     def _forecast_indoor_target(self) -> tuple[float | None, str | None]:
         """Pick the indoor temperature the forecast should assume.
@@ -244,6 +327,8 @@ class OilPredictCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "forecast_warning": self._forecast_warning,
             "temperature_offset_c": self.temperature_offset_c,
             "indoor_target_source": self._target_source,
+            "reorder": self._run_out(litres_remaining, self.reorder_level_litres),
+            "empty": self._run_out(litres_remaining, self.empty_level_litres),
         }
 
     def _read_temperature_c(self, entity_id: str) -> float | None:
@@ -314,6 +399,18 @@ class OilPredictCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         history: list[DailyHistoryPoint] = []
         outdoor_unit = self._entity_unit(self.entry.data[CONF_OUTDOOR_ENTITY])
         indoor_unit = self._entity_unit(self.entry.data[CONF_INDOOR_ENTITY])
+
+        outdoor_history: dict[date, float] = {}
+        for day, values in daily.items():
+            if "outdoor" not in values:
+                continue
+            outdoor = values["outdoor"]
+            if outdoor_unit == UnitOfTemperature.FAHRENHEIT:
+                outdoor = TemperatureConverter.convert(
+                    outdoor, UnitOfTemperature.FAHRENHEIT, UnitOfTemperature.CELSIUS
+                )
+            outdoor_history[day] = outdoor
+        self._outdoor_history = outdoor_history
         for day, values in sorted(daily.items()):
             if not all(key in values for key in role_to_entity):
                 continue

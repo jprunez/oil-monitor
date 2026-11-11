@@ -6,6 +6,7 @@ from homeassistant.const import EntityCategory, UnitOfTemperature
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
+from .const import CONF_TANK_CAPACITY, EMPTY_LITRES, REORDER_LITRES
 from .coordinator import OilPredictCoordinator
 
 
@@ -16,7 +17,13 @@ async def async_setup_entry(
 ) -> None:
     """Set up the temperature adjustment number."""
     coordinator: OilPredictCoordinator = entry.runtime_data
-    async_add_entities([TemperatureAdjustmentNumber(coordinator, entry)])
+    async_add_entities(
+        [
+            TemperatureAdjustmentNumber(coordinator, entry),
+            TankLevelNumber(coordinator, entry, "reorder"),
+            TankLevelNumber(coordinator, entry, "empty"),
+        ]
+    )
 
 
 class TemperatureAdjustmentNumber(RestoreNumber):
@@ -54,3 +61,53 @@ class TemperatureAdjustmentNumber(RestoreNumber):
         self._coordinator.temperature_offset_c = value
         self.async_write_ha_state()
         await self._coordinator.async_request_refresh()
+
+
+class TankLevelNumber(RestoreNumber):
+    """The tank level (litres) at which to reorder, or to treat as empty."""
+
+    _attr_has_entity_name = True
+    _attr_native_min_value = 0
+    _attr_native_step = 10
+    _attr_native_unit_of_measurement = "L"
+    _attr_mode = NumberMode.BOX
+    _attr_entity_category = EntityCategory.CONFIG
+
+    def __init__(
+        self, coordinator: OilPredictCoordinator, entry: ConfigEntry, level: str
+    ) -> None:
+        """Initialize the ``reorder`` or ``empty`` level setting."""
+        self._coordinator = coordinator
+        self._level = level
+        self._attr_name = {
+            "reorder": "Reorder level",
+            "empty": "Empty level (pump line)",
+        }[level]
+        self._attr_icon = "mdi:cart-arrow-down" if level == "reorder" else "mdi:gauge-empty"
+        self._attr_unique_id = f"{entry.entry_id}_{level}_level"
+        self._attr_device_info = coordinator.device_info
+        self._attr_native_max_value = float(entry.data[CONF_TANK_CAPACITY])
+        self._attr_native_value = float(
+            REORDER_LITRES if level == "reorder" else EMPTY_LITRES
+        )
+
+    async def async_added_to_hass(self) -> None:
+        """Restore the saved level after a restart."""
+        await super().async_added_to_hass()
+        last = await self.async_get_last_number_data()
+        if last is not None and last.native_value is not None:
+            self._attr_native_value = float(last.native_value)
+        self._apply()
+
+    async def async_set_native_value(self, value: float) -> None:
+        """Store a new level and recalculate the run-out dates."""
+        self._attr_native_value = value
+        self._apply()
+        self.async_write_ha_state()
+
+    def _apply(self) -> None:
+        if self._level == "reorder":
+            self._coordinator.reorder_level_litres = self._attr_native_value
+        else:
+            self._coordinator.empty_level_litres = self._attr_native_value
+        self._coordinator.async_push_live_data()

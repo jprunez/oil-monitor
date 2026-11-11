@@ -91,6 +91,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             "upper_entity": entity_id(Platform.SENSOR, "weekly_oil_use_upper"),
             "stale_entity": entity_id(Platform.BINARY_SENSOR, "tank_sensor_stale"),
             "offset_entity": entity_id(Platform.NUMBER, "temperature_adjustment"),
+            "reorder_entity": entity_id(Platform.SENSOR, "days_until_reorder"),
+            "empty_entity": entity_id(Platform.SENSOR, "days_until_empty"),
         },
     )
     return True

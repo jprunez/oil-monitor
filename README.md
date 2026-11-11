@@ -7,6 +7,7 @@ Oil Monitor is a custom Home Assistant integration that estimates heating-oil ta
 - Estimated litres remaining from an ultrasonic tank-depth sensor.
 - A warning when the tank reading is stale.
 - A seven-day usage estimate with a lower and upper estimate, when enough history and a supported weather forecast are available.
+- How long the oil will last: days until the reorder level and until empty, with dates. The first week uses the weather forecast and later weeks use last year's temperatures for the same dates. The reorder (default 250 L) and empty (default 50 L) levels can be changed on the Oil Monitor device page.
 - A dashboard with tank status and historical oil-use versus outdoor-temperature charts.
 
 This is an experimental project. Predictions are estimates, not a guarantee or a substitute for checking the tank and arranging fuel delivery.

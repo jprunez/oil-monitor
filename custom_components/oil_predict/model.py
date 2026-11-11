@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass
 import math
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import date, datetime, timedelta, timezone
 
 # Depth in centimetres mapped to percentage full, based on the tank calibration.
@@ -336,6 +336,25 @@ def fit_usage_model(samples: Sequence[DailyTrainingSample]) -> UsageModel:
     )
 
 
+def predict_day(
+    model: UsageModel, outdoor_mean_c: float, indoor_target_c: float
+) -> tuple[float, float]:
+    """Return predicted heating hours and litres for one day's mean temperature."""
+    temperature_gap = max(0.0, indoor_target_c - outdoor_mean_c)
+    heating_hours = max(
+        0.0,
+        model.runtime_intercept_hours
+        + model.runtime_hours_per_degree
+        * max(0.0, temperature_gap - model.runtime_switch_off_gap_c),
+    )
+    litres = max(
+        0.0,
+        model.oil_baseline_litres_per_day
+        + model.oil_litres_per_heating_hour * heating_hours,
+    )
+    return heating_hours, litres
+
+
 def forecast_week(
     model: UsageModel,
     forecast_outdoor_mean_c: Sequence[float],
@@ -351,18 +370,7 @@ def forecast_week(
 
     days: list[ForecastDay] = []
     for outdoor_mean in forecast_outdoor_mean_c:
-        temperature_gap = max(0.0, indoor_target_c - outdoor_mean)
-        heating_hours = max(
-            0.0,
-            model.runtime_intercept_hours
-            + model.runtime_hours_per_degree
-            * max(0.0, temperature_gap - model.runtime_switch_off_gap_c),
-        )
-        litres = max(
-            0.0,
-            model.oil_baseline_litres_per_day
-            + model.oil_litres_per_heating_hour * heating_hours,
-        )
+        heating_hours, litres = predict_day(model, outdoor_mean, indoor_target_c)
         days.append(
             ForecastDay(
                 outdoor_mean_c=outdoor_mean,
@@ -383,3 +391,48 @@ def forecast_week(
         lower_litres=max(0.0, total - uncertainty),
         upper_litres=total + uncertainty,
     )
+
+
+def seasonal_outdoor_c(
+    history: Mapping[date, float], day: date, window_days: int = 3
+) -> float | None:
+    """Typical outdoor temperature for a future day, from the same dates a year earlier.
+
+    Averages the recorded daily means within ``window_days`` of the same
+    calendar date one year before. Returns None when no history covers it.
+    """
+    try:
+        last_year = day.replace(year=day.year - 1)
+    except ValueError:  # 29 February
+        last_year = day.replace(year=day.year - 1, day=28)
+    values = [
+        history[last_year + timedelta(days=offset)]
+        for offset in range(-window_days, window_days + 1)
+        if last_year + timedelta(days=offset) in history
+    ]
+    if not values:
+        return None
+    return sum(values) / len(values)
+
+
+def days_until_level(
+    current_litres: float, level_litres: float, daily_usage: Sequence[float]
+) -> float | None:
+    """Days until the tank falls to ``level_litres`` given projected daily use.
+
+    Returns 0 when the tank is already at or below the level, a fractional
+    number of days when the level is reached within the projection, or None
+    when it is not reached within ``len(daily_usage)`` days.
+    """
+    if not math.isfinite(current_litres) or not math.isfinite(level_litres):
+        raise ValueError("Tank levels must be finite numbers")
+    remaining = current_litres - level_litres
+    if remaining <= 0:
+        return 0.0
+    for index, use in enumerate(daily_usage):
+        if use <= 0:
+            continue
+        if use >= remaining:
+            return index + remaining / use
+        remaining -= use
+    return None

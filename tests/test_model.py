@@ -19,6 +19,8 @@ build_training_samples = MODEL["build_training_samples"]
 fit_usage_model = MODEL["fit_usage_model"]
 forecast_week = MODEL["forecast_week"]
 parse_sample_timestamp = MODEL["parse_sample_timestamp"]
+seasonal_outdoor_c = MODEL["seasonal_outdoor_c"]
+days_until_level = MODEL["days_until_level"]
 
 
 def make_training_samples() -> list[object]:
@@ -162,3 +164,32 @@ class TestUsageForecast(unittest.TestCase):
         self.assertEqual(len(samples), 2)
         self.assertGreater(samples[0].litres_used, 0)
         self.assertAlmostEqual(samples[0].heating_hours, 4.0)
+
+
+class TestRunOutProjection(unittest.TestCase):
+    """Verify how long the remaining oil is projected to last."""
+
+    def test_days_until_level_interpolates_within_a_day(self) -> None:
+        """600 L down to 250 L at 10 L/day takes 35 days."""
+        self.assertAlmostEqual(days_until_level(600, 250, [10.0] * 100), 35.0)
+        self.assertAlmostEqual(days_until_level(605, 250, [10.0] * 100), 35.5)
+
+    def test_rising_usage_shortens_the_projection(self) -> None:
+        """Colder days later on use oil faster than a flat projection."""
+        flat = days_until_level(600, 50, [10.0] * 200)
+        rising = days_until_level(600, 50, [10.0 + day * 0.2 for day in range(200)])
+        self.assertLess(rising, flat)
+
+    def test_already_below_level_and_beyond_horizon(self) -> None:
+        """At or below the level is zero days; never reaching it is None."""
+        self.assertEqual(days_until_level(200, 250, [10.0] * 10), 0.0)
+        self.assertIsNone(days_until_level(600, 50, [1.0] * 30))
+
+    def test_seasonal_temperature_uses_last_year(self) -> None:
+        """A future day's typical temperature comes from the same dates last year."""
+        history = {
+            date(2025, 12, 1) + timedelta(days=offset): float(offset)
+            for offset in range(-3, 4)
+        }
+        self.assertAlmostEqual(seasonal_outdoor_c(history, date(2026, 12, 1)), 0.0)
+        self.assertIsNone(seasonal_outdoor_c(history, date(2026, 6, 1)))
