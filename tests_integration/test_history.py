@@ -43,7 +43,9 @@ def _hours():
     return [start + timedelta(hours=hour) for hour in range(DAYS * 24)]
 
 
-async def _record_history(hass: HomeAssistant, *, runtime_as_total: bool) -> None:
+async def _record_history(
+    hass: HomeAssistant, *, runtime_as_total: bool, indoor: bool = True
+) -> None:
     """Record ~4 months of hourly statistics: steady use, cold weather."""
     hours = _hours()
     first = hours[0]
@@ -62,9 +64,10 @@ async def _record_history(hass: HomeAssistant, *, runtime_as_total: bool) -> Non
     async_import_statistics(
         hass, _metadata("sensor.outdoor", "°C", mean=True), series(lambda d: 4 + 4 * ((d // 7) % 3))
     )
-    async_import_statistics(
-        hass, _metadata("sensor.indoor", "°C", mean=True), series(lambda d: 19.5)
-    )
+    if indoor:
+        async_import_statistics(
+            hass, _metadata("sensor.indoor", "°C", mean=True), series(lambda d: 19.5)
+        )
     if runtime_as_total:
         # A total_increasing runtime counter: 4 hours per day, never resetting.
         rows = []
@@ -159,3 +162,63 @@ async def test_names_the_sensor_without_history(hass: HomeAssistant) -> None:
     assert attributes["history_days"]["runtime"] == 0
     assert attributes["history_days"]["level"] >= DAYS - 1
     assert "heating runtime (sensor.runtime_without_statistics)" in attributes["forecast_warning"]
+
+
+
+async def test_thermostat_chosen_as_indoor_sensor(hass: HomeAssistant) -> None:
+    """An indoor entity without history still gives estimates, and is flagged."""
+    from custom_components.oil_predict.diagnostics import (
+        async_get_config_entry_diagnostics,
+    )
+
+    await _record_history(hass, runtime_as_total=False, indoor=False)
+    hass.states.async_set("sensor.tank_depth", "68", {"unit_of_measurement": "cm", "state_class": "measurement"})
+    hass.states.async_set("sensor.outdoor", "6", {"unit_of_measurement": "°C", "state_class": "measurement"})
+    hass.states.async_set("sensor.runtime", "2", {"unit_of_measurement": "h", "state_class": "measurement"})
+    # A thermostat-like sensor: a temperature, but no state class.
+    hass.states.async_set("sensor.thermostat", "19.1", {"unit_of_measurement": "°C"})
+    hass.states.async_set("climate.home", "heat", {"temperature": 19})
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        version=2,
+        unique_id=DOMAIN,
+        data={
+            "depth_entity": "sensor.tank_depth",
+            "level_type": "distance",
+            "tank_capacity": 1000,
+            "tank_shape": "vertical",
+            "full_distance_cm": 10,
+            "empty_distance_cm": 130,
+            "outdoor_entity": "sensor.outdoor",
+            "indoor_entity": "sensor.thermostat",
+            "indoor_target_entity": "climate.home",
+            "weather_entity": "weather.missing",
+            "runtime_entity": "sensor.runtime",
+            "stale_after_minutes": 90,
+        },
+    )
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    stale_id = er.async_get(hass).async_get_entity_id(
+        "binary_sensor", DOMAIN, f"{entry.entry_id}_tank_sensor_stale"
+    )
+    attributes = hass.states.get(stale_id).attributes
+    # History is usable thanks to the thermostat-setting fallback.
+    assert attributes["training_weeks"] >= 12
+    checks = {row["role"]: row for row in attributes["setup_check"]}
+    assert checks["indoor"]["status"] == "warning"
+    assert "no state class" in checks["indoor"]["message"]
+    assert "19.0 °C indoors" in checks["indoor"]["message"]
+    assert checks["level"]["status"] == "ok"
+    assert checks["level"]["history_days"] >= DAYS - 1
+    # The weather entity doesn't exist: flagged as a problem.
+    assert checks["weather"]["status"] == "problem"
+
+    diagnostics = await async_get_config_entry_diagnostics(hass, entry)
+    assert diagnostics["settings"]["indoor_entity"] == "sensor.thermostat"
+    assert diagnostics["history"]["indoor_history_fallback_c"] == 19
+    assert diagnostics["model"]["sample_count"] >= 12
+    assert diagnostics["sources"]["weather_entity"] == {"entity_id": "weather.missing", "found": False}
+    assert diagnostics["setup_check"] == attributes["setup_check"]

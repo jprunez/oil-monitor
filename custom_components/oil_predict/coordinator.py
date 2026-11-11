@@ -44,11 +44,14 @@ from .const import (
 from .model import (
     DEPTH_TO_PERCENT,
     LEVEL_DISTANCE,
+    LEVEL_LITRES,
+    LEVEL_PERCENT,
     MIN_TRAINING_WEEKS,
     SHAPE_CUSTOM,
     DailyHistoryPoint,
     DailyTrainingSample,
     TankConfig,
+    UsageModel,
     WeeklyForecast,
     build_training_samples,
     days_until_level,
@@ -118,6 +121,9 @@ class OilPredictCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._forecast_needs_retry = False
         self._target_source: str | None = None
         self._history_days: dict[str, int] = {}
+        self._indoor_fallback_c: float | None = None
+        self._weather_error: str | None = None
+        self.model: UsageModel | None = None
         self._history_entities: dict[str, str] = {}
         self.tank = tank_from_config(entry.data)
         self.reorder_level_litres = round(self.tank.capacity_litres * REORDER_FRACTION)
@@ -125,6 +131,11 @@ class OilPredictCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._outdoor_history: dict[date, float] = {}
         self._daily_usage_projection: list[float] | None = None
         self._upper_scale = 1.0
+
+    @property
+    def training_samples(self) -> list[DailyTrainingSample]:
+        """The clean weekly samples the model was fitted to."""
+        return list(self._training_samples)
 
     @property
     def device_info(self) -> DeviceInfo:
@@ -218,7 +229,13 @@ class OilPredictCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 return
 
             model = fit_usage_model(self._training_samples)
-            forecast_temperatures = await self._async_get_daily_forecast_c()
+            self.model = model
+            try:
+                forecast_temperatures = await self._async_get_daily_forecast_c()
+            except (HomeAssistantError, ValueError, TypeError, KeyError) as err:
+                self._weather_error = f"Could not get a 7-day daily forecast: {err}"
+                raise
+            self._weather_error = None
             indoor_target = temperature_target + self.temperature_offset_c
             self._weekly_forecast = forecast_week(
                 model, forecast_temperatures, indoor_target
@@ -248,7 +265,7 @@ class OilPredictCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         missing = [
             f"{labels[role]} ({self._history_entities[role]})"
             for role, days in self._history_days.items()
-            if days == 0
+            if days == 0 and not (role == "indoor" and self._indoor_fallback_c is not None)
         ]
         if missing:
             return (
@@ -262,6 +279,103 @@ class OilPredictCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             f"Needs at least {MIN_TRAINING_WEEKS} complete, clean weeks of history; "
             "estimates start automatically once they are recorded"
         )
+
+    def setup_check(self) -> list[dict[str, Any]]:
+        """Check each configured entity and explain anything that will cause problems."""
+        config = self.entry.data
+        items: list[tuple[str, str, str]] = [
+            ("level", "Tank sensor", config[CONF_DEPTH_ENTITY]),
+            ("outdoor", "Outdoor temperature", config[CONF_OUTDOOR_ENTITY]),
+            ("indoor", "Indoor temperature", config[CONF_INDOOR_ENTITY]),
+            ("target", "Thermostat", config[CONF_INDOOR_TARGET_ENTITY]),
+            ("weather", "Weather forecast", config[CONF_WEATHER_ENTITY]),
+        ]
+        if config.get(CONF_RUNTIME_ENTITY):
+            items.append(("runtime", "Heating runtime", config[CONF_RUNTIME_ENTITY]))
+        if config.get(CONF_TIMESTAMP_ENTITY):
+            items.append(("timestamp", "Measurement time", config[CONF_TIMESTAMP_ENTITY]))
+
+        level_units = {
+            LEVEL_DISTANCE: ("cm",),
+            LEVEL_PERCENT: ("%",),
+            LEVEL_LITRES: ("L", "l"),
+        }
+        level_names = {
+            LEVEL_DISTANCE: "a distance in cm",
+            LEVEL_PERCENT: "percent full",
+            LEVEL_LITRES: "litres",
+        }
+        rows: list[dict[str, Any]] = []
+        for role, label, entity_id in items:
+            problems: list[str] = []
+            notes: list[str] = []
+            state = self.hass.states.get(entity_id)
+            days = self._history_days.get(role)
+            if state is None:
+                problems.append(
+                    "Not found. It may have been renamed or removed; choose it again under Configure."
+                )
+            elif state.state in ("unknown", "unavailable"):
+                problems.append(f"Currently {state.state}.")
+            else:
+                unit = state.attributes.get("unit_of_measurement")
+                if role in ("level", "outdoor", "indoor", "runtime"):
+                    try:
+                        float(state.state)
+                    except ValueError:
+                        problems.append(f"Its value \"{state.state}\" is not a number.")
+                if role == "level" and unit and unit not in level_units[self.tank.level_type]:
+                    problems.append(
+                        f"Its unit is {unit}, but Oil Monitor is set up for "
+                        f"{level_names[self.tank.level_type]}. Check the sensor type under Configure."
+                    )
+                if role in ("outdoor", "indoor") and unit not in (
+                    UnitOfTemperature.CELSIUS,
+                    UnitOfTemperature.FAHRENHEIT,
+                ):
+                    problems.append(f"Its unit is {unit or 'missing'}; it should be °C or °F.")
+                if role == "target" and self._read_temperature_c(entity_id) is None:
+                    problems.append("No target temperature could be read from it.")
+                if role == "weather" and self._weather_error:
+                    problems.append(self._weather_error)
+                if role == "timestamp" and parse_sample_timestamp(state.state) is None:
+                    problems.append(f"Its value \"{state.state}\" is not a recognisable time.")
+                if role in ("level", "outdoor", "indoor", "runtime"):
+                    no_class = state.attributes.get("state_class") is None
+                    fallback = role == "indoor" and self._indoor_fallback_c is not None
+                    if no_class or days == 0:
+                        reason = (
+                            "It has no state class, so Home Assistant keeps no long-term "
+                            "statistics (daily history) for it."
+                            if no_class
+                            else "No daily history has been recorded for it yet."
+                        )
+                        if fallback:
+                            notes.append(
+                                f"{reason} Past weeks are assumed to have been "
+                                f"{self._indoor_fallback_c:.1f} °C indoors; choose a "
+                                "sensor with history under Configure for better estimates."
+                            )
+                        elif role == "outdoor":
+                            notes.append(f"{reason} Charts and estimates need it.")
+                        else:
+                            problems.append(f"{reason} Charts and estimates need it.")
+            status = "problem" if problems else "warning" if notes else "ok"
+            if status == "ok":
+                message = f"OK · {days} days of history" if days else "OK"
+            else:
+                message = " ".join(problems + notes)
+            rows.append(
+                {
+                    "role": role,
+                    "label": label,
+                    "entity_id": entity_id,
+                    "status": status,
+                    "message": message,
+                    "history_days": days,
+                }
+            )
+        return rows
 
     def _project_daily_usage(
         self,
@@ -419,6 +533,8 @@ class OilPredictCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "training_weeks": len(self._training_samples),
             "training_weeks_needed": MIN_TRAINING_WEEKS,
             "history_days": dict(self._history_days),
+            "indoor_history_fallback_c": self._indoor_fallback_c,
+            "setup_check": self.setup_check(),
             "forecast_warning": self._forecast_warning,
             "temperature_offset_c": self.temperature_offset_c,
             "indoor_target_source": self._target_source,
@@ -501,6 +617,20 @@ class OilPredictCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         }
         self._history_entities = role_to_entity
 
+        # Without any indoor history, assume the house was kept at today's
+        # thermostat setting (or current indoor temperature) in past weeks.
+        required = set(role_to_entity)
+        self._indoor_fallback_c = None
+        if self._history_days.get("indoor") == 0:
+            fallback = self._read_temperature_c(
+                self.entry.data[CONF_INDOOR_TARGET_ENTITY]
+            )
+            if fallback is None:
+                fallback = self._read_temperature_c(self.entry.data[CONF_INDOOR_ENTITY])
+            if fallback is not None:
+                self._indoor_fallback_c = fallback
+                required.discard("indoor")
+
         history: list[DailyHistoryPoint] = []
         outdoor_unit = self._entity_unit(self.entry.data[CONF_OUTDOOR_ENTITY])
         indoor_unit = self._entity_unit(self.entry.data[CONF_INDOOR_ENTITY])
@@ -517,15 +647,20 @@ class OilPredictCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             outdoor_history[day] = outdoor
         self._outdoor_history = outdoor_history
         for day, values in sorted(daily.items()):
-            if not all(key in values for key in role_to_entity):
+            if not all(key in values for key in required):
                 continue
+            if "indoor" not in values:
+                values["indoor"] = self._indoor_fallback_c
+                indoor_is_celsius = True
+            else:
+                indoor_is_celsius = False
             if outdoor_unit == UnitOfTemperature.FAHRENHEIT:
                 values["outdoor"] = TemperatureConverter.convert(
                     values["outdoor"],
                     UnitOfTemperature.FAHRENHEIT,
                     UnitOfTemperature.CELSIUS,
                 )
-            if indoor_unit == UnitOfTemperature.FAHRENHEIT:
+            if indoor_unit == UnitOfTemperature.FAHRENHEIT and not indoor_is_celsius:
                 values["indoor"] = TemperatureConverter.convert(
                     values["indoor"],
                     UnitOfTemperature.FAHRENHEIT,

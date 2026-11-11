@@ -1,0 +1,42 @@
+name: Problem report
+description: Something in Oil Monitor isn't working as expected
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a problem. First, open the **Oil Monitor** dashboard and look at the **Setup check** section; it often explains the cause directly.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What did you expect, and what did you see instead? Screenshots of the dashboard help.
+    validations:
+      required: true
+  - type: textarea
+    id: setup-check
+    attributes:
+      label: Setup check
+      description: Copy the Setup check section from the Oil Monitor dashboard, or attach a screenshot of it.
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Diagnostics file
+      description: |
+        In Home Assistant go to **Settings → Devices & services → Oil Monitor**, open the **⋮** menu and choose **Download diagnostics**. Drag the downloaded file into this box. It contains your Oil Monitor settings, sensor names and readings, but no location, passwords or tokens.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Oil Monitor version
+      description: Shown at the bottom of the Oil Monitor dashboard, e.g. v0.5.0.
+  - type: dropdown
+    id: sensor
+    attributes:
+      label: What does your tank sensor report?
+      options:
+        - Distance to the oil surface (cm)
+        - Percent full
+        - Litres
+        - Not sure

@@ -76,10 +76,18 @@ Go to **Settings → Devices & services → Oil Monitor → Configure**. The reo
 
 ## Troubleshooting
 
+Start with the **Setup check** section on the Oil Monitor dashboard. It checks each sensor you chose and explains anything that will stop Oil Monitor working well: a sensor that can't be found, is unavailable, has the wrong unit, or has no long-term statistics. For example, it catches a thermostat chosen where an indoor temperature sensor was expected.
+
+Common problems:
+
 - **No charts, or "No long-term statistics found":** the tank or outdoor sensor isn't keeping statistics. Give it `state_class: measurement`, for example through its integration's settings or a template sensor. Then wait for history to build up.
 - **Estimated use stays blank:** the grey text under it gives the reason. Usually it needs more clean weeks of history, or the weather entity doesn't provide 7 daily forecasts.
 - **Litres look wrong:** check the sensor type, capacity and full/empty distances under **Configure**. If the tank shape isn't upright or a horizontal cylinder, use a custom table.
 - **Dashboard looks out of date after an update:** restart Home Assistant, then close and reopen the browser tab. The footer shows the running version.
+
+### Reporting a problem
+
+[Open an issue](https://github.com/jprunez/oil-monitor/issues/new/choose) and attach a diagnostics file. In Home Assistant, go to **Settings → Devices & services → Oil Monitor**, open the **⋮** menu and choose **Download diagnostics**. The file contains your Oil Monitor settings, the state of each sensor it uses, how much history it found and what it learned. It doesn't contain your location, passwords or tokens.
 
 ## Development
 
