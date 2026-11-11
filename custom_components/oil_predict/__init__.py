@@ -1,5 +1,6 @@
 """Set up the Oil Monitor integration."""
 
+import hashlib
 from pathlib import Path
 
 from homeassistant.components import frontend
@@ -27,13 +28,18 @@ from .coordinator import OilPredictCoordinator
 PANEL_PATH = "oil-monitor"
 PANEL_COMPONENT = "oil-monitor-panel"
 PANEL_MODULE_URL = "/oil_predict/oil-monitor-panel.js"
+PANEL_FILE = Path(__file__).parent / "www" / "oil-monitor-panel.js"
+
+
+def _panel_build_id() -> str:
+    """Return a short hash of the panel file, used to bust browser caches."""
+    return hashlib.sha256(PANEL_FILE.read_bytes()).hexdigest()[:8]
 
 
 async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     """Register the bundled Oil Monitor dashboard module with Home Assistant."""
-    panel_file = Path(__file__).parent / "www" / "oil-monitor-panel.js"
     await hass.http.async_register_static_paths(
-        [StaticPathConfig(PANEL_MODULE_URL, str(panel_file), cache_headers=False)]
+        [StaticPathConfig(PANEL_MODULE_URL, str(PANEL_FILE), cache_headers=False)]
     )
     return True
 
@@ -56,6 +62,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             platform, DOMAIN, f"{entry.entry_id}_{key}"
         )
 
+    # A new URL for every panel version, so browsers and the companion app
+    # cannot keep running an old cached copy after an update.
+    build_id = await hass.async_add_executor_job(_panel_build_id)
+
     if frontend.async_panel_exists(hass, PANEL_PATH):
         frontend.async_remove_panel(hass, PANEL_PATH, warn_if_unknown=False)
     await async_register_panel(
@@ -64,8 +74,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         webcomponent_name=PANEL_COMPONENT,
         sidebar_title="Oil Monitor",
         sidebar_icon="mdi:oil",
-        module_url=PANEL_MODULE_URL,
+        module_url=f"{PANEL_MODULE_URL}?v={build_id}",
         config={
+            "build": build_id,
             "depth_entity": entry.data[CONF_DEPTH_ENTITY],
             "timestamp_entity": entry.data[CONF_TIMESTAMP_ENTITY],
             "outdoor_entity": entry.data[CONF_OUTDOOR_ENTITY],

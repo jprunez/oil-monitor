@@ -414,7 +414,7 @@ class OilMonitorPanel extends HTMLElement {
           <article class="chart-card"><h3>Oil use vs outdoor temperature</h3><p>Each point is a clean week. Dashed line shows a simple trend, not a guarantee.</p>${this._scatter(weeks)}</article>
         </div></section>
         <section class="section"><h2>Home heating conditions</h2><p>Live context from your selected Home Assistant entities.</p><div class="details"><div class="detail"><span class="metric-label">Indoor temperature</span><b>${this._format(indoor?.state, 1)} ${indoor?.attributes?.unit_of_measurement || "°C"}</b></div><div class="detail"><span class="metric-label">Thermostat target</span><b>${this._format(targetValue, 1)} ${targetUnit}</b></div><div class="detail"><span class="metric-label">Heating runtime today</span><b>${runtimeValue}</b></div><div class="detail"><span class="metric-label">History range</span><b>${this._rangeDays} days</b></div></div></section>
-        <p class="foot">Forecasts are estimates learned from available tank, temperature and heating history. A limited or noisy history can make the range wide or misleading. Use this as a planning aid, not as the only basis for ordering oil.</p>
+        <p class="foot">Forecasts are estimates learned from available tank, temperature and heating history. A limited or noisy history can make the range wide or misleading. Use this as a planning aid, not as the only basis for ordering oil.<br>Dashboard build ${this._escape(config.build || "unknown")}</p>
       </main>`;
 
     this.shadowRoot.querySelector("select")?.addEventListener("change", (event) => {
