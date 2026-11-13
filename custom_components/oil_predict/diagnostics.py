@@ -121,5 +121,6 @@ async def async_get_config_entry_diagnostics(
         "forecast": asdict(forecast) if forecast else None,
         "forecast_warning": data.get("forecast_warning"),
         "live": {key: data.get(key) for key in live_keys},
+        "data_check": coordinator.data_check(),
         "last_update_success": coordinator.last_update_success,
     }

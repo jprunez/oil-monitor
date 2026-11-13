@@ -70,6 +70,9 @@ async def test_setup_flow_distance_sensor_upright_tank(hass: HomeAssistant, reco
     )
     assert result["step_id"] == "sensors"
     result = await hass.config_entries.flow.async_configure(result["flow_id"], SENSORS)
+    # The sensor check is shown before saving; confirming it creates the entry.
+    assert result["step_id"] == "check"
+    result = await hass.config_entries.flow.async_configure(result["flow_id"], {})
     assert result["type"] is FlowResultType.CREATE_ENTRY
     data = result["data"]
     assert data["tank_shape"] == "vertical"
@@ -223,6 +226,8 @@ async def test_settings_screen_changes_tank_and_clears_optional_sensor(
             "stale_after_minutes": 120,
         },
     )
+    assert result["step_id"] == "check"
+    result = await hass.config_entries.options.async_configure(result["flow_id"], {})
     assert result["type"] is FlowResultType.CREATE_ENTRY
     await hass.async_block_till_done()
 

@@ -10,7 +10,7 @@
           "tank_capacity": "Usable tank capacity (L)"
         },
         "data_description": {
-          "depth_entity": "The sensor on your oil tank. It needs long-term statistics (state class \"measurement\") for the history and estimates.",
+          "depth_entity": "The sensor on your oil tank, reporting a number: the distance from the sensor down to the oil in cm, percent full, or litres. It must keep long-term statistics: check it is listed under Developer tools → Statistics. If it isn't, it needs a state class of \"measurement\".",
           "level_type": "A distance sensor (e.g. ultrasonic) measures from the sensor down to the oil. Many ready-made gauges report percent full or litres instead.",
           "tank_capacity": "How many litres the tank holds when full."
         }
@@ -33,7 +33,7 @@
       },
       "sensors": {
         "title": "Temperatures and weather",
-        "description": "These drive the usage estimates. Estimates start after about 6 complete, clean weeks of history.",
+        "description": "These drive the usage estimates. Estimates start after about 6 complete, clean weeks of history: a clean week has data from every sensor on every day and no oil delivery. The next step checks each sensor you choose.",
         "data": {
           "outdoor_entity": "Outdoor temperature sensor",
           "indoor_entity": "Indoor temperature sensor",
@@ -47,17 +47,21 @@
           "history_location": "Town or postcode for weather history (optional)"
         },
         "data_description": {
-          "outdoor_entity": "A temperature sensor with long-term statistics, in °C or °F.",
-          "indoor_entity": "A room or thermostat temperature sensor with long-term statistics.",
+          "outdoor_entity": "A sensor reporting the outdoor temperature in °C or °F. It must keep long-term statistics: check it is listed under Developer tools → Statistics. If it isn't, it needs a state class of \"measurement\".",
+          "indoor_entity": "A sensor reporting the temperature inside the house in °C or °F. Choose a temperature sensor, not the thermostat itself. It must keep long-term statistics: check it is listed under Developer tools → Statistics. If it isn't, it needs a state class of \"measurement\".",
           "indoor_target_entity": "Your thermostat (climate entity) or a sensor holding its target temperature.",
           "weather_entity": "A weather entity that provides seven daily forecasts.",
-          "runtime_entity": "Hours the heating has run today, resetting daily. Improves accuracy; leave empty if you don't have one.",
+          "runtime_entity": "Hours the heating has run, either today (resetting each day) or as a running total. Improves accuracy; leave empty if you don't have one. It must keep long-term statistics: check it is listed under Developer tools → Statistics. If it isn't, it needs a state class of \"measurement\".",
           "timestamp_entity": "When the tank sensor actually took its reading. Useful for radio/MQTT sensors with retained messages; leave empty to use the time Home Assistant received the reading.",
           "stale_after_minutes": "Set this a little longer than your sensor's normal reporting interval.",
           "tank_temp_entity": "Air temperature at the tank sensor. Ultrasonic sensors read slightly long in cold air; Oil Monitor checks your history for this and corrects it if needed. Leave empty to use the outdoor temperature.",
           "weather_history": "Downloads about 25 years of daily temperatures for your area from Open-Meteo (free, no account) to project mild, typical and cold winters. Only an approximate location, rounded to about 10 km, is sent. Turn off to keep everything local.",
           "history_location": "A town, or the first part of your postcode (e.g. YO10). Leave empty to use Home Assistant's home location. Either way it is rounded to about 10 km."
         }
+      },
+      "check": {
+        "title": "Check your sensors",
+        "description": "{summary}\n\n✅ is ready. ⚠️ works with a limitation. ❌ needs fixing before Oil Monitor can use it.\n\nYou can save now and fix things later: nothing here stops you. The **Data check** tab on the Oil Monitor page shows this list at any time, with how much history each sensor has."
       }
     },
     "error": {
@@ -80,7 +84,7 @@
           "tank_capacity": "Usable tank capacity (L)"
         },
         "data_description": {
-          "depth_entity": "The sensor on your oil tank. It needs long-term statistics (state class \"measurement\") for the history and estimates.",
+          "depth_entity": "The sensor on your oil tank, reporting a number: the distance from the sensor down to the oil in cm, percent full, or litres. It must keep long-term statistics: check it is listed under Developer tools → Statistics. If it isn't, it needs a state class of \"measurement\".",
           "level_type": "A distance sensor (e.g. ultrasonic) measures from the sensor down to the oil. Many ready-made gauges report percent full or litres instead.",
           "tank_capacity": "How many litres the tank holds when full."
         }
@@ -103,7 +107,7 @@
       },
       "sensors": {
         "title": "Temperatures and weather",
-        "description": "These drive the usage estimates. Estimates start after about 6 complete, clean weeks of history.",
+        "description": "These drive the usage estimates. Estimates start after about 6 complete, clean weeks of history: a clean week has data from every sensor on every day and no oil delivery. The next step checks each sensor you choose.",
         "data": {
           "outdoor_entity": "Outdoor temperature sensor",
           "indoor_entity": "Indoor temperature sensor",
@@ -117,17 +121,21 @@
           "history_location": "Town or postcode for weather history (optional)"
         },
         "data_description": {
-          "outdoor_entity": "A temperature sensor with long-term statistics, in °C or °F.",
-          "indoor_entity": "A room or thermostat temperature sensor with long-term statistics.",
+          "outdoor_entity": "A sensor reporting the outdoor temperature in °C or °F. It must keep long-term statistics: check it is listed under Developer tools → Statistics. If it isn't, it needs a state class of \"measurement\".",
+          "indoor_entity": "A sensor reporting the temperature inside the house in °C or °F. Choose a temperature sensor, not the thermostat itself. It must keep long-term statistics: check it is listed under Developer tools → Statistics. If it isn't, it needs a state class of \"measurement\".",
           "indoor_target_entity": "Your thermostat (climate entity) or a sensor holding its target temperature.",
           "weather_entity": "A weather entity that provides seven daily forecasts.",
-          "runtime_entity": "Hours the heating has run today, resetting daily. Improves accuracy; leave empty if you don't have one.",
+          "runtime_entity": "Hours the heating has run, either today (resetting each day) or as a running total. Improves accuracy; leave empty if you don't have one. It must keep long-term statistics: check it is listed under Developer tools → Statistics. If it isn't, it needs a state class of \"measurement\".",
           "timestamp_entity": "When the tank sensor actually took its reading. Useful for radio/MQTT sensors with retained messages; leave empty to use the time Home Assistant received the reading.",
           "stale_after_minutes": "Set this a little longer than your sensor's normal reporting interval.",
           "tank_temp_entity": "Air temperature at the tank sensor. Ultrasonic sensors read slightly long in cold air; Oil Monitor checks your history for this and corrects it if needed. Leave empty to use the outdoor temperature.",
           "weather_history": "Downloads about 25 years of daily temperatures for your area from Open-Meteo (free, no account) to project mild, typical and cold winters. Only an approximate location, rounded to about 10 km, is sent. Turn off to keep everything local.",
           "history_location": "A town, or the first part of your postcode (e.g. YO10). Leave empty to use Home Assistant's home location. Either way it is rounded to about 10 km."
         }
+      },
+      "check": {
+        "title": "Check your sensors",
+        "description": "{summary}\n\n✅ is ready. ⚠️ works with a limitation. ❌ needs fixing before Oil Monitor can use it.\n\nYou can save now and fix things later: nothing here stops you. The **Data check** tab on the Oil Monitor page shows this list at any time, with how much history each sensor has."
       }
     },
     "error": {

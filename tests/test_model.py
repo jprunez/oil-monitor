@@ -22,6 +22,7 @@ DEPTH_TO_PERCENT = MODEL["DEPTH_TO_PERCENT"]
 DailyTrainingSample = MODEL["DailyTrainingSample"]
 DailyHistoryPoint = MODEL["DailyHistoryPoint"]
 build_training_samples = MODEL["build_training_samples"]
+classify_weeks = MODEL["classify_weeks"]
 fit_usage_model = MODEL["fit_usage_model"]
 forecast_week = MODEL["forecast_week"]
 parse_sample_timestamp = MODEL["parse_sample_timestamp"]
@@ -519,5 +520,93 @@ class TestWindAndSun(unittest.TestCase):
         self.assertIsNone(fit_weather_terms(model, samples[:8]))
 
 
+
+class TestWeekReports(unittest.TestCase):
+    """Verify each week is labelled with why it was or wasn't used."""
+
+    def _points(self, litres_by_offset, skip=()):
+        monday = date(2026, 1, 5)
+        return [
+            DailyHistoryPoint(
+                day=monday + timedelta(days=offset),
+                litres_mean=litres,
+                outdoor_mean_c=5.0,
+                indoor_mean_c=19.0,
+            )
+            for offset, litres in litres_by_offset.items()
+            if offset not in skip
+        ]
+
+    def test_statuses_for_each_kind_of_week(self) -> None:
+        """Used, missing-day, delivery, implausible and invalid weeks are told apart."""
+        litres = {}
+        level = 900.0
+        for offset in range(-1, 35):
+            if offset == 16:
+                level += 400  # delivery in week 3
+            elif offset == 23:
+                level -= 400  # sensor jump in week 4
+            else:
+                level -= 8
+            litres[offset] = level
+        litres[30] = float("nan")  # bad value in week 5
+        weeks = classify_weeks(self._points(litres, skip={9}), 1000)
+        statuses = [report.status for report, _ in weeks]
+        # The history starts on a Sunday, so the week before the first Monday
+        # is incomplete and reported as missing days.
+        self.assertEqual(
+            statuses,
+            ["missing_days", "used", "missing_days", "refill", "implausible_use", "invalid"],
+        )
+        self.assertEqual(weeks[1][0].week_start, date(2026, 1, 5))
+        self.assertAlmostEqual(weeks[1][0].litres_used, 56.0)
+        self.assertIsNotNone(weeks[1][1])
+        self.assertTrue(all(sample is None for i, (_, sample) in enumerate(weeks) if i != 1))
+
+    def test_matches_build_training_samples(self) -> None:
+        """The samples are exactly those from the weeks marked used."""
+        litres = {offset: 900.0 - 8 * offset for offset in range(-1, 28)}
+        points = self._points(litres, skip={12})
+        used = [sample for report, sample in classify_weeks(points, 1000) if sample]
+        self.assertEqual(used, build_training_samples(points, 1000))
+        self.assertEqual(len(used), 3)
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_time_weighted_average_counts_night_setback() -> None:
+    from datetime import datetime, timedelta, timezone
+
+    from custom_components.oil_predict.model import time_weighted_average
+
+    start = datetime(2026, 11, 1, tzinfo=timezone.utc)
+    samples = []
+    for day in range(2):
+        base = start + timedelta(days=day)
+        samples.append((base, 7.0))  # midnight-06:00 setback
+        samples.append((base + timedelta(hours=6), 20.0))  # 06:00-24:00
+    average = time_weighted_average(samples, start + timedelta(days=2), min_seconds=86400)
+    assert average == (6 * 7.0 + 18 * 20.0) / 24
+    # Unknown spans (thermostat off) are skipped, and too little data gives None.
+    assert time_weighted_average([(start, None), (start + timedelta(hours=1), 18.0)], start + timedelta(hours=2)) == 18.0
+    assert time_weighted_average([(start, 20.0)], start + timedelta(hours=2), min_seconds=86400) is None
+
+
+def test_active_setpoints_ignore_night_setback() -> None:
+    from datetime import datetime, timedelta, timezone
+
+    from custom_components.oil_predict.model import active_setpoints, time_weighted_average
+
+    start = datetime(2026, 11, 1, tzinfo=timezone.utc)
+    samples = []
+    for day in range(2):
+        base = start + timedelta(days=day)
+        samples.append((base, 7.0))  # overnight setback
+        samples.append((base + timedelta(hours=6), 20.0))
+        samples.append((base + timedelta(hours=18), 19.0))  # evening, still heating
+    active = active_setpoints(samples, 3.0)
+    assert [value for _, value in active] == [None, 20.0, 19.0, None, 20.0, 19.0]
+    average = time_weighted_average(active, start + timedelta(days=2))
+    assert average == (12 * 20.0 + 6 * 19.0) / 18

@@ -206,15 +206,33 @@ class DailyHistoryPoint:
     runtime_max_hours: float | None = None
 
 
-def build_training_samples(
+WEEK_USED = "used"
+WEEK_MISSING_DAYS = "missing_days"
+WEEK_REFILL = "refill"
+WEEK_IMPLAUSIBLE = "implausible_use"
+WEEK_INVALID = "invalid"
+
+
+@dataclass(frozen=True)
+class WeekReport:
+    """What happened to one Monday-to-Sunday week when preparing training data."""
+
+    week_start: date
+    status: str  # one of the WEEK_* values
+    litres_used: float | None = None  # tank change over the week, when known
+
+
+def classify_weeks(
     points: Sequence[DailyHistoryPoint], tank_capacity_litres: float
-) -> list[DailyTrainingSample]:
-    """Build low-noise daily-average training samples from complete weeks.
+) -> list[tuple[WeekReport, DailyTrainingSample | None]]:
+    """Turn daily history into weekly samples, saying why each week was kept or not.
 
     Each sample represents the average day in one complete Monday-to-Sunday
     week. Tank-volume differences are calculated across the full week, reducing
-    the impact of sensor quantisation. Weeks with a refill, a missing day or an
-    implausible amount of use are skipped.
+    the impact of sensor quantisation. A week is not used when a day is
+    missing (including the Sunday before, which anchors the tank change),
+    there was a delivery, the amount used is implausible, or a value is
+    invalid.
     """
     by_day = {point.day: point for point in points}
     if len(by_day) != len(points):
@@ -230,7 +248,10 @@ def build_training_samples(
     first_day = min(by_day)
     last_day = max(by_day)
     monday = first_day - timedelta(days=first_day.weekday())
-    samples: list[DailyTrainingSample] = []
+    weeks: list[tuple[WeekReport, DailyTrainingSample | None]] = []
+
+    def skip(week_start: date, status: str, litres_used: float | None = None) -> None:
+        weeks.append((WeekReport(week_start, status, litres_used), None))
 
     while monday + timedelta(days=6) <= last_day:
         days = [monday + timedelta(days=offset) for offset in range(7)]
@@ -238,6 +259,7 @@ def build_training_samples(
         previous_sunday = by_day.get(monday - timedelta(days=1))
         monday += timedelta(days=7)
         if previous_sunday is None or any(point is None for point in week):
+            skip(days[0], WEEK_MISSING_DAYS)
             continue
 
         complete_week = [point for point in week if point is not None]
@@ -248,8 +270,10 @@ def build_training_samples(
             for value in (point.litres_mean, point.outdoor_mean_c, point.indoor_mean_c)
         ]
         if not all(math.isfinite(value) for value in numeric_values):
+            skip(days[0], WEEK_INVALID)
             continue
         if any(point.litres_mean < 0 for point in interval):
+            skip(days[0], WEEK_INVALID)
             continue
 
         runtimes = [point.runtime_max_hours for point in complete_week]
@@ -257,35 +281,52 @@ def build_training_samples(
         if has_runtime and not all(
             math.isfinite(runtime) and runtime >= 0 for runtime in runtimes
         ):
+            skip(days[0], WEEK_INVALID)
             continue
 
+        weekly_usage = previous_sunday.litres_mean - complete_week[-1].litres_mean
         # A refill makes the tank level rise. Skip that week rather than
         # treating a refill as negative consumption.
         if any(
             current.litres_mean - previous.litres_mean > refill_rise
             for previous, current in zip(interval, interval[1:])
         ):
+            skip(days[0], WEEK_REFILL, weekly_usage)
             continue
 
-        weekly_usage = previous_sunday.litres_mean - complete_week[-1].litres_mean
         # Reject implausibly large weekly changes, likely caused by a sensor
         # jump rather than normal consumption.
         if weekly_usage < 0 or weekly_usage > max_weekly_use:
+            skip(days[0], WEEK_IMPLAUSIBLE, weekly_usage)
             continue
 
-        samples.append(
-            DailyTrainingSample(
-                outdoor_mean_c=sum(p.outdoor_mean_c for p in complete_week) / 7,
-                indoor_mean_c=sum(p.indoor_mean_c for p in complete_week) / 7,
-                heating_hours=(
-                    sum(runtimes) / 7 if has_runtime else None  # type: ignore[arg-type]
+        weeks.append(
+            (
+                WeekReport(days[0], WEEK_USED, weekly_usage),
+                DailyTrainingSample(
+                    outdoor_mean_c=sum(p.outdoor_mean_c for p in complete_week) / 7,
+                    indoor_mean_c=sum(p.indoor_mean_c for p in complete_week) / 7,
+                    heating_hours=(
+                        sum(runtimes) / 7 if has_runtime else None  # type: ignore[arg-type]
+                    ),
+                    litres_used=weekly_usage / 7,
+                    week_start=days[0],
                 ),
-                litres_used=weekly_usage / 7,
-                week_start=days[0],
             )
         )
 
-    return samples
+    return weeks
+
+
+def build_training_samples(
+    points: Sequence[DailyHistoryPoint], tank_capacity_litres: float
+) -> list[DailyTrainingSample]:
+    """Build training samples from the weeks ``classify_weeks`` accepts."""
+    return [
+        sample
+        for _, sample in classify_weeks(points, tank_capacity_litres)
+        if sample is not None
+    ]
 
 
 @dataclass(frozen=True)
@@ -969,3 +1010,42 @@ def weather_terms_help(
     if base is None or with_weather is None or base.rmse_litres <= 0:
         return False
     return with_weather.rmse_litres <= base.rmse_litres * (1 - MIN_WEATHER_GAIN)
+
+
+def time_weighted_average(
+    samples: list[tuple[datetime, float | None]],
+    end: datetime,
+    min_seconds: float = 0.0,
+) -> float | None:
+    """Average a stepwise value, weighting each by how long it was held.
+
+    ``samples`` are (start time, value) in time order; each value holds until
+    the next sample (or ``end``). Spans with no value (None) are skipped.
+    Returns None when less than ``min_seconds`` of known values is covered.
+    """
+    total = 0.0
+    seconds = 0.0
+    for index, (start, value) in enumerate(samples):
+        until = samples[index + 1][0] if index + 1 < len(samples) else end
+        held = (until - start).total_seconds()
+        if value is None or held <= 0:
+            continue
+        total += value * held
+        seconds += held
+    if seconds <= 0 or seconds < min_seconds:
+        return None
+    return total / seconds
+
+
+def active_setpoints(
+    samples: list[tuple[datetime, float | None]], margin_c: float
+) -> list[tuple[datetime, float | None]]:
+    """Blank out setback settings: those more than ``margin_c`` below the highest."""
+    known = [value for _, value in samples if value is not None]
+    if not known:
+        return samples
+    floor = max(known) - margin_c
+    return [
+        (start, value if value is not None and value >= floor else None)
+        for start, value in samples
+    ]

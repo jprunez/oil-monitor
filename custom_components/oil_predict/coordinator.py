@@ -1,6 +1,6 @@
 """Read Home Assistant tank entities and prepare integration data."""
 
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Callable, Mapping
 from dataclasses import asdict, replace
 from datetime import date, datetime, timedelta
@@ -8,6 +8,7 @@ from functools import partial
 import logging
 from typing import Any
 
+from homeassistant.components.recorder.history import state_changes_during_period
 from homeassistant.components.recorder.statistics import statistics_during_period
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import UnitOfTemperature
@@ -45,11 +46,20 @@ from .const import (
     EMPTY_FRACTION,
     REORDER_FRACTION,
 )
+from .checks import (
+    STATISTIC_ROLES,
+    check_entity,
+    entity_roles,
+    read_temperature_c,
+    temperature_c_from_state,
+)
 from .climate_history import ClimateHistoryManager
 from .model import (
     DEPTH_TO_PERCENT,
     FALLBACK_SCENARIO_SHIFT_C,
     REFILL_RISE_FRACTION,
+    active_setpoints,
+    time_weighted_average,
     LEVEL_DISTANCE,
     LEVEL_LITRES,
     LEVEL_PERCENT,
@@ -61,10 +71,15 @@ from .model import (
     BacktestResult,
     TankConfig,
     UsageModel,
+    WEEK_IMPLAUSIBLE,
+    WEEK_MISSING_DAYS,
+    WEEK_REFILL,
+    WEEK_USED,
     WeatherTerms,
+    WeekReport,
     WeeklyForecast,
     backtest_weekly,
-    build_training_samples,
+    classify_weeks,
     climate_offset,
     days_until_level,
     estimate_temperature_drift,
@@ -91,6 +106,13 @@ PROJECTION_DAYS = 365
 # The dashboard chart shows this many days, one point every few days.
 PROJECTION_CHART_DAYS = 182
 PROJECTION_CHART_STEP = 3
+# The thermostat's active (non-setback) target is averaged over this period,
+# so a setback in force right now doesn't set the forecast.
+TARGET_AVERAGE_PERIOD = timedelta(days=7)
+# Settings this far below the week's highest are setbacks (night, away,
+# frost protection): the house cools slowly, so they barely move the daily
+# average indoor temperature the model learns from.
+SETBACK_MARGIN_C = 3.0
 
 # How often the stale flag is re-evaluated when no new reading arrives.
 STALE_CHECK_INTERVAL = timedelta(minutes=5)
@@ -140,6 +162,10 @@ class OilPredictCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._forecast_needs_retry = False
         self._target_source: str | None = None
         self._history_days: dict[str, int] = {}
+        # For the Data check page: per-sensor coverage and per-week outcomes.
+        self._coverage: dict[str, dict[str, Any]] = {}
+        self._coverage_weeks: list[str] = []
+        self._week_reports: list[dict[str, Any]] = []
         self._indoor_fallback_c: float | None = None
         # Ultrasonic temperature correction, decided from the history.
         self.temp_correction: dict[str, Any] = {"active": False, "checked": False}
@@ -256,7 +282,7 @@ class OilPredictCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self._forecast_warning = self._history_warning()
                 return
 
-            temperature_target, self._target_source = self._forecast_indoor_target()
+            temperature_target, self._target_source = await self._async_forecast_indoor_target()
             if temperature_target is None:
                 # Source sensors are often still loading just after a restart.
                 self._forecast_needs_retry = True
@@ -340,106 +366,19 @@ class OilPredictCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     def setup_check(self) -> list[dict[str, Any]]:
         """Check each configured entity and explain anything that will cause problems."""
-        config = self.entry.data
-        items: list[tuple[str, str, str]] = [
-            ("level", "Tank sensor", config[CONF_DEPTH_ENTITY]),
-            ("outdoor", "Outdoor temperature", config[CONF_OUTDOOR_ENTITY]),
-            ("indoor", "Indoor temperature", config[CONF_INDOOR_ENTITY]),
-            ("target", "Thermostat", config[CONF_INDOOR_TARGET_ENTITY]),
-            ("weather", "Weather forecast", config[CONF_WEATHER_ENTITY]),
-        ]
-        if config.get(CONF_RUNTIME_ENTITY):
-            items.append(("runtime", "Heating runtime", config[CONF_RUNTIME_ENTITY]))
-        if config.get(CONF_TANK_TEMP_ENTITY):
-            items.append(("tank_temp", "Tank temperature", config[CONF_TANK_TEMP_ENTITY]))
-        if config.get(CONF_TIMESTAMP_ENTITY):
-            items.append(("timestamp", "Measurement time", config[CONF_TIMESTAMP_ENTITY]))
-
-        level_units = {
-            LEVEL_DISTANCE: ("cm",),
-            LEVEL_PERCENT: ("%",),
-            LEVEL_LITRES: ("L", "l"),
-        }
-        level_names = {
-            LEVEL_DISTANCE: "a distance in cm",
-            LEVEL_PERCENT: "percent full",
-            LEVEL_LITRES: "litres",
-        }
-        rows: list[dict[str, Any]] = []
-        for role, label, entity_id in items:
-            problems: list[str] = []
-            notes: list[str] = []
-            state = self.hass.states.get(entity_id)
-            days = self._history_days.get(role)
-            if state is None:
-                problems.append(
-                    "Not found. It may have been renamed or removed; choose it again under Configure."
-                )
-            elif state.state in ("unknown", "unavailable"):
-                problems.append(f"Currently {state.state}.")
-            else:
-                unit = state.attributes.get("unit_of_measurement")
-                if role in ("level", "outdoor", "indoor", "runtime", "tank_temp"):
-                    try:
-                        float(state.state)
-                    except ValueError:
-                        problems.append(f"Its value \"{state.state}\" is not a number.")
-                if role == "level" and unit and unit not in level_units[self.tank.level_type]:
-                    problems.append(
-                        f"Its unit is {unit}, but Oil Monitor is set up for "
-                        f"{level_names[self.tank.level_type]}. Check the sensor type under Configure."
-                    )
-                if role in ("outdoor", "indoor", "tank_temp") and unit not in (
-                    UnitOfTemperature.CELSIUS,
-                    UnitOfTemperature.FAHRENHEIT,
-                ):
-                    problems.append(f"Its unit is {unit or 'missing'}; it should be °C or °F.")
-                if role == "target" and self._read_temperature_c(entity_id) is None:
-                    problems.append("No target temperature could be read from it.")
-                if role == "weather" and self._weather_error:
-                    problems.append(self._weather_error)
-                if role == "timestamp" and parse_sample_timestamp(state.state) is None:
-                    problems.append(f"Its value \"{state.state}\" is not a recognisable time.")
-                if role in ("level", "outdoor", "indoor", "runtime", "tank_temp"):
-                    no_class = state.attributes.get("state_class") is None
-                    fallback = role == "indoor" and self._indoor_fallback_c is not None
-                    if no_class or days == 0:
-                        reason = (
-                            "It has no state class, so Home Assistant keeps no long-term "
-                            "statistics (daily history) for it."
-                            if no_class
-                            else "No daily history has been recorded for it yet."
-                        )
-                        if fallback:
-                            notes.append(
-                                f"{reason} Past weeks are assumed to have been "
-                                f"{self._indoor_fallback_c:.1f} °C indoors; choose a "
-                                "sensor with history under Configure for better estimates."
-                            )
-                        elif role == "tank_temp":
-                            notes.append(
-                                f"{reason} The outdoor temperature is used for the "
-                                "tank reading correction instead."
-                            )
-                        elif role == "outdoor":
-                            notes.append(f"{reason} Charts and estimates need it.")
-                        else:
-                            problems.append(f"{reason} Charts and estimates need it.")
-            status = "problem" if problems else "warning" if notes else "ok"
-            if status == "ok":
-                message = f"OK · {days} days of history" if days else "OK"
-            else:
-                message = " ".join(problems + notes)
-            rows.append(
-                {
-                    "role": role,
-                    "label": label,
-                    "entity_id": entity_id,
-                    "status": status,
-                    "message": message,
-                    "history_days": days,
-                }
+        rows: list[dict[str, Any]] = [
+            check_entity(
+                self.hass,
+                role,
+                label,
+                entity_id,
+                level_type=self.tank.level_type,
+                history_days=self._history_days.get(role),
+                indoor_fallback_c=self._indoor_fallback_c,
+                weather_error=self._weather_error,
             )
+            for role, label, entity_id in entity_roles(self.entry.data)
+        ]
         info = self.scenario_info
         if info is not None:
             status = "ok"
@@ -679,7 +618,7 @@ class OilPredictCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if litres is None or self._usage is None:
             return None
         today = dt_util.now().date()
-        points: list[dict[str, Any]] = []
+        points: list[dict[str, Any]] = self._level_history_since_fill(today)
         level = {name: litres for name in self._usage}
         # What the tank would do from today's level if oil were used exactly
         # as it was over the same dates last year (deliveries ignored).
@@ -690,6 +629,7 @@ class OilPredictCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 points.append(
                     {
                         "date": (today + timedelta(days=offset)).isoformat(),
+                        "actual": round(litres, 1) if offset == 0 else None,
                         "litres": round(max(0.0, level["typical"]), 1),
                         "mild": round(max(0.0, level["mild"]), 1),
                         "cold": round(max(0.0, level["cold"]), 1),
@@ -708,6 +648,44 @@ class OilPredictCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     last_year = None  # no reading a year ago: stop the line
                 elif after - before <= refill_rise:
                     last_year -= before - after
+        return points
+
+    def _level_history_since_fill(self, today: date) -> list[dict[str, Any]]:
+        """Recorded litres from the most recent fill up to yesterday.
+
+        Walks back from today until the day after a refill (a day-to-day rise
+        above the refill threshold), a gap in the history, or about a year.
+        Points use the same spacing as the projection so the two line up.
+        """
+        history = self._litres_history
+        refill_rise = REFILL_RISE_FRACTION * self.tank.capacity_litres
+        start = today
+        for _ in range(PROJECTION_DAYS):
+            previous = start - timedelta(days=1)
+            if previous not in history:
+                break
+            if start in history and history[start] - history[previous] > refill_rise:
+                break  # ``start`` is the first day after the fill
+            start = previous
+        if start >= today:
+            return []
+        # Align to the projection's step so today stays on the grid.
+        step = PROJECTION_CHART_STEP
+        first = (today - start).days // step * step
+        points = []
+        for back in range(first, 0, -step):
+            day = today - timedelta(days=back)
+            value = history.get(day)
+            points.append(
+                {
+                    "date": day.isoformat(),
+                    "actual": None if value is None else round(max(0.0, value), 1),
+                    "litres": None,
+                    "mild": None,
+                    "cold": None,
+                    "last_year": None,
+                }
+            )
         return points
 
     def _run_out(self, litres: float | None, level: float) -> dict[str, Any]:
@@ -739,13 +717,18 @@ class OilPredictCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             result[f"{prefix}date"] = (today + timedelta(days=int(days))).isoformat()
         return result
 
-    def _forecast_indoor_target(self) -> tuple[float | None, str | None]:
+    async def _async_forecast_indoor_target(self) -> tuple[float | None, str | None]:
         """Pick the indoor temperature the forecast should assume.
 
-        Prefer the thermostat target; fall back to the current indoor
-        temperature, then to the recent average indoor temperature in history.
+        Prefer the thermostat's active target over the past week, ignoring
+        setbacks; then its current value; then the current indoor
+        temperature; then the recent average indoor temperature in history.
         """
-        target = self._read_temperature_c(self.entry.data[CONF_INDOOR_TARGET_ENTITY])
+        entity_id = self.entry.data[CONF_INDOOR_TARGET_ENTITY]
+        average = await self._async_active_target_c(entity_id)
+        if average is not None:
+            return average, "thermostat target when heating (7-day average)"
+        target = self._read_temperature_c(entity_id)
         if target is not None:
             return target, "thermostat target"
         indoor = self._read_temperature_c(self.entry.data[CONF_INDOOR_ENTITY])
@@ -758,6 +741,37 @@ class OilPredictCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 "recent average indoor temperature",
             )
         return None, None
+
+    async def _async_active_target_c(self, entity_id: str) -> float | None:
+        """Time-weighted average of the active thermostat target this week.
+
+        Setback periods (more than ``SETBACK_MARGIN_C`` below the week's
+        highest setting) are left out. Returns None with less than six hours
+        of usable history, so the caller falls back to the current setting.
+        """
+        end = dt_util.utcnow()
+        start = end - TARGET_AVERAGE_PERIOD
+        try:
+            changes = await get_instance(self.hass).async_add_executor_job(
+                partial(
+                    state_changes_during_period,
+                    self.hass,
+                    start,
+                    end,
+                    entity_id,
+                    include_start_time_state=True,
+                )
+            )
+        except HomeAssistantError as err:
+            _LOGGER.debug("Could not read thermostat history: %s", err)
+            return None
+        samples = [
+            (max(state.last_changed, start), temperature_c_from_state(self.hass, state))
+            for state in changes.get(entity_id.lower(), [])
+        ]
+        return time_weighted_average(
+            active_setpoints(samples, SETBACK_MARGIN_C), end, min_seconds=6 * 3600
+        )
 
     def _build_data(self) -> dict[str, Any]:
         """Read the current tank state and work out litres and freshness."""
@@ -834,30 +848,7 @@ class OilPredictCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     def _read_temperature_c(self, entity_id: str) -> float | None:
         """Read a temperature in Celsius from a sensor or a climate entity's target."""
-        state = self.hass.states.get(entity_id)
-        if state is None:
-            return None
-        if state.domain == "climate":
-            raw = state.attributes.get("temperature")
-            unit = self.hass.config.units.temperature_unit
-        else:
-            if state.state in ("unknown", "unavailable"):
-                return None
-            raw = state.state
-            unit = state.attributes.get(
-                "unit_of_measurement", UnitOfTemperature.CELSIUS
-            )
-        try:
-            value = float(raw)
-        except (TypeError, ValueError):
-            return None
-        if unit == UnitOfTemperature.FAHRENHEIT:
-            return TemperatureConverter.convert(
-                value, UnitOfTemperature.FAHRENHEIT, UnitOfTemperature.CELSIUS
-            )
-        if unit == UnitOfTemperature.CELSIUS:
-            return value
-        return None
+        return read_temperature_c(self.hass, entity_id)
 
     async def _async_load_training_history(self) -> list[DailyTrainingSample]:
         """Read one year of daily long-term statistics and prepare clean weeks."""
@@ -907,6 +898,7 @@ class OilPredictCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             for role in role_to_entity
         }
         self._history_entities = role_to_entity
+        self._update_coverage(daily, role_to_entity)
 
         # Without any indoor history, assume the house was kept at today's
         # thermostat setting (or current indoor temperature) in past weeks.
@@ -923,6 +915,7 @@ class OilPredictCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 required.discard("indoor")
 
         history: list[DailyHistoryPoint] = []
+        bad_level_days: set[date] = set()
         outdoor_unit = self._entity_unit(self.entry.data[CONF_OUTDOOR_ENTITY])
         indoor_unit = self._entity_unit(self.entry.data[CONF_INDOOR_ENTITY])
 
@@ -983,6 +976,7 @@ class OilPredictCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     )
                 litres = reading_to_litres(level, self.tank)
             except ValueError:
+                bad_level_days.add(day)
                 continue
             history.append(
                 DailyHistoryPoint(
@@ -994,7 +988,208 @@ class OilPredictCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 )
             )
 
-        return build_training_samples(history, self.tank.capacity_litres)
+        classified = classify_weeks(history, self.tank.capacity_litres)
+        self._week_reports = [
+            self._describe_week(report, daily, required, bad_level_days)
+            for report, _ in classified
+        ]
+        return [sample for _, sample in classified if sample is not None]
+
+    def _update_coverage(
+        self, daily: Mapping[date, Mapping[str, float]], roles: Mapping[str, str]
+    ) -> None:
+        """Summarise how much daily history each sensor has over the last year."""
+        today = dt_util.now().date()
+        this_monday = today - timedelta(days=today.weekday())
+        mondays = [this_monday - timedelta(weeks=back) for back in range(52, -1, -1)]
+        self._coverage_weeks = [monday.isoformat() for monday in mondays]
+        self._coverage = {}
+        for role in roles:
+            days = sorted(day for day, values in daily.items() if role in values)
+            largest_gap = 0
+            for previous, current in zip(days, days[1:]):
+                largest_gap = max(largest_gap, (current - previous).days - 1)
+            present = set(days)
+            self._coverage[role] = {
+                "days": len(days),
+                "first_day": days[0].isoformat() if days else None,
+                "last_day": days[-1].isoformat() if days else None,
+                "largest_gap_days": largest_gap,
+                "weekly_days": [
+                    sum(1 for offset in range(7) if monday + timedelta(days=offset) in present)
+                    for monday in mondays
+                ],
+            }
+
+    def _describe_week(
+        self,
+        report: WeekReport,
+        daily: Mapping[date, Mapping[str, float]],
+        required: set[str],
+        bad_level_days: set[date],
+    ) -> dict[str, Any]:
+        """Explain in plain words what happened to one week of history."""
+        labels = {
+            "level": "tank",
+            "outdoor": "outdoor temperature",
+            "indoor": "indoor temperature",
+            "runtime": "heating runtime",
+        }
+        litres = report.litres_used
+        missing: dict[str, int] = {}
+        if report.status == WEEK_USED:
+            reason = f"Used {litres:.0f} L"
+        elif report.status == WEEK_REFILL:
+            reason = "Delivery detected, so the amount used can't be measured"
+        elif report.status == WEEK_IMPLAUSIBLE:
+            reason = (
+                f"The tank level rose by {-litres:.0f} L without a delivery"
+                if litres is not None and litres < 0
+                else f"A drop of {litres:.0f} L in one week looks like a sensor fault"
+            )
+        elif report.status == WEEK_MISSING_DAYS:
+            # The Sunday before anchors the week's tank change, so it counts too.
+            days = [report.week_start + timedelta(days=offset) for offset in range(-1, 7)]
+            for role in sorted(required):
+                count = sum(1 for day in days if role not in daily.get(day, {}))
+                if count:
+                    missing[labels.get(role, role)] = count
+            bad = sum(1 for day in days if day in bad_level_days)
+            if bad:
+                missing["tank (reading out of range)"] = bad
+            reason = "No data from " + ", ".join(
+                f"{name} on {count} day{'s' if count != 1 else ''}"
+                for name, count in missing.items()
+            ) if missing else "Some days had no data"
+        else:
+            reason = "A reading was not a valid number"
+        return {
+            "week_start": report.week_start.isoformat(),
+            "status": report.status,
+            "litres_used": None if litres is None else round(litres, 1),
+            "reason": reason,
+            "missing": missing,
+        }
+
+    def data_check(self) -> dict[str, Any]:
+        """Everything the dashboard's Data check page shows."""
+        rows = self.setup_check()
+        sensors: list[dict[str, Any]] = []
+        for row in rows:
+            if not row["entity_id"]:
+                continue
+            state = self.hass.states.get(row["entity_id"])
+            sensors.append(
+                {
+                    **row,
+                    "state": state.state if state else None,
+                    "unit": state.attributes.get("unit_of_measurement") if state else None,
+                    "state_class": state.attributes.get("state_class") if state else None,
+                    "needs_history": row["role"] in STATISTIC_ROLES,
+                    "coverage": self._coverage.get(row["role"]),
+                }
+            )
+        first_week = self._coverage_weeks[0] if self._coverage_weeks else ""
+        weeks = [week for week in self._week_reports if week["week_start"] >= first_week]
+        clean = len(self._training_samples)
+        return {
+            "requirements": self._requirements(sensors, clean),
+            "sensors": sensors,
+            "week_starts": list(self._coverage_weeks),
+            "weeks": weeks,
+            "week_counts": dict(Counter(week["status"] for week in weeks)),
+            "clean_weeks": clean,
+            "weeks_needed": MIN_TRAINING_WEEKS,
+            "extras": [row for row in rows if not row["entity_id"]],
+            "history_checked_at": (
+                self._history_loaded_at.isoformat() if self._history_loaded_at else None
+            ),
+            "forecast_warning": self._forecast_warning,
+        }
+
+    def _requirements(
+        self, sensors: list[dict[str, Any]], clean_weeks: int
+    ) -> list[dict[str, Any]]:
+        """The setup requirements, each with whether it is met and how to fix it."""
+        statistics_fix = (
+            "Give the sensor a state class of \"measurement\" so Home Assistant keeps "
+            "long-term statistics for it (see the README), or choose a different sensor "
+            "under Settings → Devices & services → Oil Monitor → Configure."
+        )
+        texts = {
+            "level": (
+                "A tank sensor with daily history",
+                "Litres remaining come from its current reading; estimates are learned "
+                "from how the level fell over past weeks.",
+                statistics_fix,
+            ),
+            "outdoor": (
+                "An outdoor temperature sensor with daily history",
+                "Oil use is learned against how cold it was outside.",
+                statistics_fix,
+            ),
+            "indoor": (
+                "An indoor temperature sensor with daily history",
+                "Heating demand depends on the gap between indoors and outdoors. Choose "
+                "a temperature sensor here, not the thermostat itself.",
+                statistics_fix,
+            ),
+            "target": (
+                "A thermostat whose target temperature can be read",
+                "Estimates assume the house is kept at this temperature.",
+                "Choose your thermostat (climate entity) or a sensor holding its target "
+                "temperature under Configure.",
+            ),
+            "weather": (
+                "A weather forecast with 7 daily forecasts",
+                "The coming week's estimate follows the forecast temperatures.",
+                "Choose a weather entity that provides daily forecasts under Configure.",
+            ),
+            "runtime": (
+                "Heating runtime with daily history (optional)",
+                "Improves the estimates when available.",
+                "It needs a state class of \"measurement\" (hours today) or \"total\" "
+                "(a running counter), or leave it empty under Configure.",
+            ),
+            "tank_temp": (
+                "Tank temperature with daily history (optional)",
+                "Used to correct ultrasonic readings for cold air.",
+                "Without it the outdoor temperature is used; no action is needed.",
+            ),
+            "timestamp": (
+                "Tank measurement time (optional)",
+                "Used to warn when the tank reading is out of date.",
+                "Its value must be a date and time or a Unix timestamp, or leave it "
+                "empty under Configure.",
+            ),
+        }
+        requirements = [
+            {
+                "title": texts[sensor["role"]][0],
+                "why": texts[sensor["role"]][1],
+                "fix": texts[sensor["role"]][2] if sensor["status"] != "ok" else "",
+                "status": sensor["status"],
+                "detail": f"{sensor['entity_id']}: {sensor['message']}",
+            }
+            for sensor in sensors
+            if sensor["role"] in texts
+        ]
+        enough = clean_weeks >= MIN_TRAINING_WEEKS
+        requirements.append(
+            {
+                "title": f"At least {MIN_TRAINING_WEEKS} complete, clean weeks of history",
+                "why": "A clean week has data from every sensor on every day and no "
+                "oil delivery. Estimates are learned from these weeks.",
+                "fix": ""
+                if enough
+                else "See \"Weeks used for learning\" below for why weeks were left out. "
+                "If the sensors are set up correctly, this builds up on its own.",
+                "status": "ok" if enough else "problem",
+                "detail": f"{clean_weeks} clean week{'s' if clean_weeks != 1 else ''} found "
+                "in the last 12 months.",
+            }
+        )
+        return requirements
 
     def _update_temp_correction(
         self,

@@ -4,12 +4,14 @@ import hashlib
 import logging
 from pathlib import Path
 
-from homeassistant.components import frontend
+import voluptuous as vol
+
+from homeassistant.components import frontend, websocket_api
 from homeassistant.components.http import StaticPathConfig
 from homeassistant.components.panel_custom import async_register_panel
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import entity_registry as er
 from homeassistant.loader import async_get_integration
 
@@ -50,7 +52,24 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
     await hass.http.async_register_static_paths(
         [StaticPathConfig(PANEL_MODULE_URL, str(PANEL_FILE), cache_headers=False)]
     )
+    websocket_api.async_register_command(hass, websocket_data_check)
     return True
+
+
+@websocket_api.websocket_command({vol.Required("type"): f"{DOMAIN}/data_check"})
+@callback
+def websocket_data_check(
+    hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict
+) -> None:
+    """Return the data behind the dashboard's Data check page."""
+    for entry in hass.config_entries.async_entries(DOMAIN):
+        coordinator = getattr(entry, "runtime_data", None)
+        if isinstance(coordinator, OilPredictCoordinator):
+            connection.send_result(msg["id"], coordinator.data_check())
+            return
+    connection.send_error(
+        msg["id"], "not_loaded", "Oil Monitor is not set up or has not finished loading."
+    )
 
 
 async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:

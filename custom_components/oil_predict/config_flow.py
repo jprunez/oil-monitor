@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+from datetime import timedelta
+from functools import partial
+import logging
 from typing import Any
 
 import voluptuous as vol
+
+from homeassistant.components.recorder.statistics import statistics_during_period
 
 from homeassistant.config_entries import (
     ConfigEntry,
@@ -14,6 +19,10 @@ from homeassistant.config_entries import (
 )
 from homeassistant.core import callback
 from homeassistant.helpers import selector
+from homeassistant.helpers.recorder import get_instance
+from homeassistant.util import dt as dt_util
+
+from .checks import STATISTIC_ROLES, check_entity, entity_roles, read_temperature_c
 
 from .const import (
     CONF_CALIBRATION,
@@ -50,6 +59,10 @@ from .model import (
     format_calibration,
     parse_calibration,
 )
+
+_LOGGER = logging.getLogger(__name__)
+
+STATUS_ICONS = {"ok": "✅", "warning": "⚠️", "problem": "❌"}
 
 OPTIONAL_ENTITIES = (
     CONF_RUNTIME_ENTITY,
@@ -175,6 +188,71 @@ class _OilMonitorSteps:
             return self._form("shape", SHAPE_SCHEMA, errors)
         return self._form("shape", SHAPE_SCHEMA)
 
+    async def async_step_check(self, user_input: dict[str, Any] | None = None):
+        """Show a verdict on each chosen sensor before saving."""
+        if user_input is not None:
+            return self._finish()  # type: ignore[attr-defined]
+        return self.async_show_form(  # type: ignore[attr-defined]
+            step_id="check",
+            data_schema=vol.Schema({}),
+            description_placeholders={"summary": await self._async_check_summary()},
+        )
+
+    async def _async_history_days(self, roles: list[tuple[str, str, str]]) -> dict[str, int]:
+        """Count days of daily statistics per role over the last year."""
+        hass = self.hass  # type: ignore[attr-defined]
+        wanted = {entity_id: role for role, _, entity_id in roles if role in STATISTIC_ROLES}
+        if not wanted:
+            return {}
+        now = dt_util.utcnow()
+        try:
+            result = await get_instance(hass).async_add_executor_job(
+                partial(
+                    statistics_during_period,
+                    hass,
+                    now - timedelta(days=370),
+                    now,
+                    set(wanted),
+                    "day",
+                    None,
+                    {"mean", "max", "change"},
+                )
+            )
+        except Exception as err:  # noqa: BLE001 - the check must never block setup
+            _LOGGER.debug("Could not read statistics for the setup check: %s", err)
+            return {}
+        days: dict[str, int] = {}
+        for entity_id, role in wanted.items():
+            keys = ("max", "change") if role == "runtime" else ("mean",)
+            days[role] = sum(
+                1
+                for row in result.get(entity_id, [])
+                if any(row.get(key) is not None for key in keys)
+            )
+        return days
+
+    async def _async_check_summary(self) -> str:
+        """One line per chosen entity: an icon, its name and what was found."""
+        hass = self.hass  # type: ignore[attr-defined]
+        roles = entity_roles(self._values)
+        history_days = await self._async_history_days(roles)
+        fallback = read_temperature_c(hass, self._values[CONF_INDOOR_TARGET_ENTITY])
+        lines = []
+        for role, label, entity_id in roles:
+            row = check_entity(
+                hass,
+                role,
+                label,
+                entity_id,
+                level_type=self._values.get(CONF_LEVEL_TYPE, LEVEL_DISTANCE),
+                history_days=history_days.get(role),
+                indoor_fallback_c=fallback,
+            )
+            lines.append(
+                f"{STATUS_ICONS[row['status']]} **{label}** ({entity_id}): {row['message']}"
+            )
+        return "\n\n".join(lines)
+
     def _sensors_input(self, user_input: dict[str, Any]) -> None:
         # Optional entities left empty must be removed, not kept from before.
         for key in OPTIONAL_ENTITIES:
@@ -212,8 +290,11 @@ class OilPredictConfigFlow(_OilMonitorSteps, ConfigFlow, domain=DOMAIN):
         """Choose the temperature, weather and optional sensors."""
         if user_input is not None:
             self._sensors_input(user_input)
-            return self.async_create_entry(title="Oil Monitor", data=self._values)
+            return await self.async_step_check()
         return self._form("sensors", SENSORS_SCHEMA)
+
+    def _finish(self) -> ConfigFlowResult:
+        return self.async_create_entry(title="Oil Monitor", data=self._values)
 
 
 class OilPredictOptionsFlow(_OilMonitorSteps, OptionsFlow):
@@ -233,10 +314,13 @@ class OilPredictOptionsFlow(_OilMonitorSteps, OptionsFlow):
         """Choose the temperature, weather and optional sensors."""
         if user_input is not None:
             self._sensors_input(user_input)
-            # Store settings in the entry's data (cleared optional sensors
-            # must disappear); the update listener reloads the integration.
-            self.hass.config_entries.async_update_entry(
-                self.config_entry, data=self._values, options={}
-            )
-            return self.async_create_entry(data={})
+            return await self.async_step_check()
         return self._form("sensors", SENSORS_SCHEMA)
+
+    def _finish(self) -> ConfigFlowResult:
+        # Store settings in the entry's data (cleared optional sensors must
+        # disappear); the update listener reloads the integration.
+        self.hass.config_entries.async_update_entry(
+            self.config_entry, data=self._values, options={}
+        )
+        return self.async_create_entry(data={})

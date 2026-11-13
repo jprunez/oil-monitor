@@ -439,7 +439,14 @@ async def test_winter_scenarios(
     assert empty.attributes["earliest_date"] <= empty.attributes["date"] <= empty.attributes["latest_date"]
     point = empty.attributes["projection"][-1]
     assert point["cold"] <= point["litres"] <= point["mild"]
-    assert set(point) == {"date", "litres", "mild", "cold", "last_year"}
+    assert set(point) == {"date", "actual", "litres", "mild", "cold", "last_year"}
+    assert point["actual"] is None
+    # Recorded levels since the last fill lead up to today's point.
+    projection = empty.attributes["projection"]
+    today_index = next(i for i, p in enumerate(projection) if p["litres"] is not None)
+    assert projection[today_index]["actual"] == projection[today_index]["litres"]
+    assert all(p["litres"] is None for p in projection[:today_index])
+    assert all(p["date"] < projection[today_index]["date"] for p in projection[:today_index])
     # The test history is only four months long, so there is nothing from a year ago.
     assert point["last_year"] is None
 
