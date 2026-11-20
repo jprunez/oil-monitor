@@ -413,6 +413,19 @@ class TestWinterScenarios(unittest.TestCase):
         self.assertEqual(cold[0], 18.0)  # 90th percentile year
         self.assertIsNone(pick_scenarios(yearly[:4]))
 
+    def test_scenarios_stay_ordered_when_a_cold_year_starts_mild(self) -> None:
+        """A year that is cold overall but mild early cannot put cold above typical."""
+        yearly = [[10.0] * 200 for _ in range(9)]
+        yearly.append([1.0] * 60 + [40.0] * 140)  # mild start, very cold later
+        typical, mild, cold = pick_scenarios(yearly)
+        used = {"typical": 0.0, "mild": 0.0, "cold": 0.0}
+        for i in range(200):
+            for name, series in (("typical", typical), ("mild", mild), ("cold", cold)):
+                self.assertGreaterEqual(series[i], 0.0)
+                used[name] += series[i]
+            self.assertLessEqual(used["mild"], used["typical"] + 1e-9)
+            self.assertGreaterEqual(used["cold"], used["typical"] - 1e-9)
+
 
 
 class TestBacktest(unittest.TestCase):

@@ -826,18 +826,35 @@ def pick_scenarios(
 ) -> tuple[list[float], list[float], list[float]] | None:
     """Reduce per-year daily usage to (typical, mild, cold) daily usage.
 
-    Typical is the day-by-day average across years. Mild and cold are the
-    actual years at the 10th and 90th percentile of total use over the first
-    ``rank_days`` days. Returns None with too few years.
+    Typical is the day-by-day average across years. Mild and cold follow the
+    10th and 90th percentile of oil used *so far* on each day, so at every
+    point in the season mild has used no more than typical and cold no less.
+    (Picking whole years ranked over the season let a year with a cold
+    February but a mild December sit above typical for weeks.) Returns None
+    with too few years. ``rank_days`` is kept for compatibility.
     """
     if len(yearly_usage) < MIN_SCENARIO_YEARS:
         return None
     count = len(yearly_usage)
     length = min(len(usage) for usage in yearly_usage)
     typical = [sum(usage[i] for usage in yearly_usage) / count for i in range(length)]
-    ranked = sorted(yearly_usage, key=lambda usage: sum(usage[:rank_days]))
-    mild = list(ranked[round(MILD_QUANTILE * (count - 1))][:length])
-    cold = list(ranked[round(COLD_QUANTILE * (count - 1))][:length])
+    totals = [0.0] * count
+    used = {"typical": 0.0, "mild": 0.0, "cold": 0.0}
+    mild: list[float] = []
+    cold: list[float] = []
+    for i in range(length):
+        for year, usage in enumerate(yearly_usage):
+            totals[year] += usage[i]
+        ranked = sorted(totals)
+        used["typical"] += typical[i]
+        # Each year's running total only grows, so these percentiles do too.
+        mild_total = min(ranked[round(MILD_QUANTILE * (count - 1))], used["typical"])
+        cold_total = max(ranked[round(COLD_QUANTILE * (count - 1))], used["typical"])
+        mild_total = max(mild_total, used["mild"])
+        cold_total = max(cold_total, used["cold"])
+        mild.append(mild_total - used["mild"])
+        cold.append(cold_total - used["cold"])
+        used["mild"], used["cold"] = mild_total, cold_total
     return typical, mild, cold
 
 
