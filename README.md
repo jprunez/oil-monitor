@@ -11,6 +11,7 @@ Oil Monitor tells you how much heating oil is in your tank, how much you are lik
 - **Estimated oil use for the next 7 days**, with a likely range, based on the weather forecast.
 - **How long the oil will last**: days until your reorder level and until empty, with dates and a projected-level chart for **mild, typical and cold winters**. The first week follows the weather forecast. Later weeks use about 25 years of real temperatures for your area.
 - **History charts** of weekly oil use against outdoor temperature, including the temperature at which your heating switches off.
+- **A Boiler tab** (with a flow temperature sensor): how many hours a day the heating runs, oil per heating hour, a relative boiler efficiency that warns when a service may be due, how fast the house loses heat, whether the boiler is weather compensated and, with a return sensor, the flow–return difference and how much of the time a condensing boiler can condense.
 - **Settings on the dashboard** for the reorder level, the empty level and a "what if it were warmer or cooler indoors" adjustment.
 
 ## What you need
@@ -23,10 +24,12 @@ Oil Monitor tells you how much heating oil is in your tank, how much you are lik
 | Thermostat | Yes | Your thermostat (climate entity) or a sensor holding its target temperature. |
 | Weather forecast | Yes | A weather entity with 7 daily forecasts (most weather integrations provide this). |
 | Daily heating runtime sensor | Optional | Hours the heating has run today, resetting each day. Makes estimates more accurate. |
+| Boiler flow temperature sensor | Optional | Water temperature on the pipe leaving the boiler (a clamp-on probe is fine). Powers the **Boiler** tab. Without a runtime sensor, the heating hours it shows are also tried in the estimates and kept only if they make past forecasts more accurate. |
+| Boiler return temperature sensor | Optional | Water temperature on the pipe coming back to the boiler. Adds the flow–return difference, condensing time and what a cooler return would save. |
 | Tank temperature sensor | Optional | Air temperature at the tank sensor. Used to correct ultrasonic readings, which read slightly long in cold air (about 2 cm over a 20 °C swing). Oil Monitor checks your history and only corrects if your sensor actually drifts. Without this sensor the outdoor temperature is used. |
 | Tank measurement time sensor | Optional | When the tank sensor actually took its reading. Useful for radio/MQTT sensors that resend old readings. |
 
-**Important:** the tank, outdoor and indoor sensors (and the runtime sensor if you use one) must keep **long-term statistics**. That means they need a *state class* of `measurement`. You can check under **Developer tools → Statistics**: each sensor should be listed there. Without statistics there is no history, so no charts or estimates.
+**Important:** the tank, outdoor and indoor sensors (and the runtime, flow and return sensors if you use them) must keep **long-term statistics**. That means they need a *state class* of `measurement`. You can check under **Developer tools → Statistics**: each sensor should be listed there. Without statistics there is no history, so no charts or estimates.
 
 Estimates start once there are about **6 complete, clean weeks** of history. A clean week has data for every day and no oil delivery. Until about 14 weeks they are marked as early estimates, with a wider range. If your sensors have already been recording, this history is used straight away.
 
@@ -80,6 +83,7 @@ Go to **Settings → Devices & services → Oil Monitor → Configure**. The reo
 | Tank sensor stale | On when the reading is missing or older than your limit. Its attributes show how many clean weeks of history there are. |
 | Estimated oil use next 7 days, lower and upper estimate | The 7-day estimate and its range. |
 | Days until reorder level, Days until empty | How long the oil will last in a typical winter, with `date`, `earliest_date` (cold winter) and `latest_date` (mild winter) attributes. Useful for automations, e.g. a phone notification when reorder is under 7 days away. |
+| Heating efficiency | Only with a flow sensor. Heat delivered per litre over the last 4 weeks, where 100 % is your house's usual. Attributes include `service_suggested`, `litres_per_heating_hour`, `heating_hours_per_day`, flow/return temperatures and `condensing_share`. |
 | Reorder level, Empty level, Forecast temperature adjustment | Settings (also on the dashboard). Reorder defaults to 25 % of capacity, empty to 5 %. |
 
 ## Troubleshooting

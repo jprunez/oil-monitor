@@ -537,3 +537,87 @@ async def test_wind_is_used_when_it_explains_past_use(
     rows = {row["role"]: row for row in stale.attributes["setup_check"]}
     assert rows["wind_sun"]["message"].startswith("On.")
     assert stale.attributes["forecast_warning"] is None
+
+
+async def test_boiler_flow_sensor_analysis(hass: HomeAssistant) -> None:
+    """Hourly flow/return history drives the Boiler tab and heating hours."""
+    await _record_history(hass, runtime_as_total=False, weather_driven=True)
+    hours = _hours()
+    first = hours[0]
+
+    def outdoor_at(d: float) -> float:
+        return 4 + 4 * ((d // 7) % 3)
+
+    flow_rows, return_rows = [], []
+    for hour in hours:
+        d = (hour - first).total_seconds() / 86400
+        on = 0.4 * (19.5 - outdoor_at(d))  # heating hours that day, from 06:00
+        share = min(1.0, max(0.0, on - (hour.hour - 6))) if hour.hour >= 6 else 0.0
+        idle = 21.5
+        flow_max, ret_max = (70.0, 52.0) if share > 0 else (idle + 0.5, idle + 0.3)
+        flow_rows.append(
+            {"start": hour, "mean": idle + share * (70 - idle), "min": idle, "max": flow_max}
+        )
+        return_rows.append(
+            {"start": hour, "mean": idle + share * (52 - idle), "min": idle, "max": ret_max}
+        )
+    async_import_statistics(hass, _metadata("sensor.flow", "°C", mean=True), flow_rows)
+    async_import_statistics(hass, _metadata("sensor.return", "°C", mean=True), return_rows)
+    await async_wait_recording_done(hass)
+
+    hass.states.async_set("sensor.tank_depth", "68", {"unit_of_measurement": "cm"})
+    hass.states.async_set("sensor.outdoor", "6", {"unit_of_measurement": "°C"})
+    hass.states.async_set("sensor.indoor", "19.5", {"unit_of_measurement": "°C"})
+    hass.states.async_set("climate.home", "heat", {"temperature": 19})
+    for entity_id, value in (("sensor.flow", "68"), ("sensor.return", "50")):
+        hass.states.async_set(
+            entity_id, value, {"unit_of_measurement": "°C", "state_class": "measurement"}
+        )
+
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        version=2,
+        unique_id=DOMAIN,
+        data={
+            "depth_entity": "sensor.tank_depth",
+            "level_type": "distance",
+            "tank_capacity": 1000,
+            "tank_shape": "custom",
+            "full_distance_cm": 9,
+            "empty_distance_cm": 126,
+            "calibration": "9:100, 17:90, 30:80, 41:70, 55:60, 66:50, 78:40, 90:30, 101:20, 113:10, 126:0",
+            "outdoor_entity": "sensor.outdoor",
+            "indoor_entity": "sensor.indoor",
+            "indoor_target_entity": "climate.home",
+            "weather_entity": "weather.home",
+            "flow_entity": "sensor.flow",
+            "return_entity": "sensor.return",
+            "stale_after_minutes": 90,
+        },
+    )
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    coordinator = entry.runtime_data
+    boiler = coordinator.boiler
+    assert boiler["status"] == "ok", boiler
+    assert boiler["has_return"]
+    assert boiler["summary"]["drop_c"] == pytest.approx(18, abs=0.5)
+    assert boiler["summary"]["condensing_share"] == 1.0
+    assert boiler["burn"]["r2"] > 0.8, boiler["burn"]
+    assert boiler["efficiency"]["latest_percent"] == pytest.approx(100, abs=10)
+    assert coordinator.boiler_hours["status"] in ("on", "off_no_gain"), coordinator.boiler_hours
+
+    rows = {row["role"]: row for row in coordinator.setup_check()}
+    assert rows["flow"]["status"] == "ok", rows["flow"]
+    assert rows["return"]["status"] == "ok", rows["return"]
+    assert rows["boiler"]["message"].startswith("On."), rows["boiler"]
+
+    efficiency_id = er.async_get(hass).async_get_entity_id(
+        "sensor", DOMAIN, f"{entry.entry_id}_heating_efficiency"
+    )
+    assert efficiency_id
+    state = hass.states.get(efficiency_id)
+    assert float(state.state) == pytest.approx(100, abs=10)
+    assert state.attributes["litres_per_heating_hour"] > 0

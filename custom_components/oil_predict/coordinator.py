@@ -28,12 +28,14 @@ from .const import (
     CONF_CALIBRATION,
     CONF_DEPTH_ENTITY,
     CONF_EMPTY_DISTANCE,
+    CONF_FLOW_ENTITY,
     CONF_FULL_DISTANCE,
     CONF_HISTORY_LOCATION,
     CONF_INDOOR_ENTITY,
     CONF_INDOOR_TARGET_ENTITY,
     CONF_LEVEL_TYPE,
     CONF_OUTDOOR_ENTITY,
+    CONF_RETURN_ENTITY,
     CONF_RUNTIME_ENTITY,
     CONF_STALE_AFTER_MINUTES,
     CONF_TANK_CAPACITY,
@@ -54,6 +56,7 @@ from .checks import (
     temperature_c_from_state,
 )
 from .climate_history import ClimateHistoryManager
+from .heating import HourPoint, analyse_boiler
 from .model import (
     DEPTH_TO_PERCENT,
     FALLBACK_SCENARIO_SHIFT_C,
@@ -64,6 +67,7 @@ from .model import (
     LEVEL_LITRES,
     LEVEL_PERCENT,
     MIN_TRAINING_WEEKS,
+    MIN_WEATHER_GAIN,
     MIN_WEATHER_WEEKS,
     SHAPE_CUSTOM,
     DailyHistoryPoint,
@@ -176,6 +180,10 @@ class OilPredictCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.weather_terms: WeatherTerms | None = None
         self.weather_terms_info: dict[str, Any] = {"status": "off_no_data"}
         self._history_entities: dict[str, str] = {}
+        # Boiler analysis from flow/return temperatures (the Boiler tab).
+        self.boiler: dict[str, Any] = {"status": "no_sensor"}
+        self.boiler_hours: dict[str, Any] = {"status": "off"}
+        self._runtime_daily: dict[date, float] = {}
         self.tank = tank_from_config(entry.data)
         self.reorder_level_litres = round(self.tank.capacity_litres * REORDER_FRACTION)
         self.empty_level_litres = round(self.tank.capacity_litres * EMPTY_FRACTION)
@@ -269,6 +277,7 @@ class OilPredictCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 or dt_util.utcnow() - self._history_loaded_at > timedelta(hours=24)
             ):
                 self._training_samples = await self._async_load_training_history()
+                await self._async_update_boiler()
                 self._history_loaded_at = dt_util.utcnow()
                 # Score past weeks with models that never saw them (many small
                 # fits, so off the event loop).
@@ -348,7 +357,7 @@ class OilPredictCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             f"{labels[role]} ({self._history_entities[role]})"
             for role, days in self._history_days.items()
             if days == 0
-            and role != "tank_temp"
+            and role not in ("tank_temp", "flow", "return")
             and not (role == "indoor" and self._indoor_fallback_c is not None)
         ]
         if missing:
@@ -437,6 +446,17 @@ class OilPredictCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     "entity_id": "",
                     "status": "ok",
                     "message": messages[weather["status"]],
+                    "history_days": None,
+                }
+            )
+        if self.entry.data.get(CONF_FLOW_ENTITY):
+            rows.append(
+                {
+                    "role": "boiler",
+                    "label": "Boiler analysis",
+                    "entity_id": "",
+                    "status": "ok" if self.boiler.get("status") == "ok" else "warning",
+                    "message": self._boiler_message(),
                     "history_days": None,
                 }
             )
@@ -612,6 +632,155 @@ class OilPredictCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         }
         if self.weather_terms_info["status"] == "on":
             self.backtest = scored
+
+    def _boiler_message(self) -> str:
+        """One line on the boiler analysis for the setup check."""
+        if self.boiler.get("status") != "ok":
+            return self.boiler.get("message") or "Waiting for the first history load."
+        hours = self.boiler_hours
+        if hours["status"] == "on":
+            use = (
+                "Flow-based heating hours are used in the estimates: they made past "
+                f"weekly forecasts {hours['gain_percent']:.0f} % more accurate "
+                f"(tested on {hours['weeks']} weeks)."
+            )
+        elif hours["status"] == "off_no_gain":
+            use = (
+                "Flow-based heating hours were tested on your history but didn't make "
+                "past forecasts more accurate, so the estimates don't use them."
+            )
+        elif hours["status"] == "runtime_sensor":
+            use = "Your runtime sensor is used for the estimates."
+        else:
+            use = (
+                "Flow-based heating hours will be tested in the estimates once there "
+                f"are enough clean weeks ({MIN_TRAINING_WEEKS + 1})."
+            )
+        return f"On. {use} See the Boiler tab."
+
+    async def _async_update_boiler(self) -> None:
+        """Analyse hourly flow/return history and, if it helps, use it to forecast."""
+        flow_id = self.entry.data.get(CONF_FLOW_ENTITY)
+        self.boiler_hours = {"status": "off"}
+        if not flow_id:
+            self.boiler = {"status": "no_sensor"}
+            return
+        return_id = self.entry.data.get(CONF_RETURN_ENTITY)
+        indoor_id = self.entry.data[CONF_INDOOR_ENTITY]
+        ids = {flow_id, indoor_id} | ({return_id} if return_id else set())
+        now = dt_util.utcnow()
+        try:
+            result = await get_instance(self.hass).async_add_executor_job(
+                partial(
+                    statistics_during_period,
+                    self.hass,
+                    now - timedelta(days=370),
+                    now,
+                    ids,
+                    "hour",
+                    None,
+                    {"mean", "max"},
+                )
+            )
+        except HomeAssistantError as err:
+            self.boiler = {"status": "error", "message": f"Could not read history: {err}"}
+            return
+
+        def series(entity_id: str | None) -> dict[datetime, tuple[float, float]]:
+            if not entity_id:
+                return {}
+            fahrenheit = self._entity_unit(entity_id) == UnitOfTemperature.FAHRENHEIT
+            out: dict[datetime, tuple[float, float]] = {}
+            for row in result.get(entity_id, []):
+                mean, peak = row.get("mean"), row.get("max")
+                if mean is None:
+                    continue
+                if peak is None:
+                    peak = mean
+                if fahrenheit:
+                    mean, peak = (
+                        TemperatureConverter.convert(
+                            value, UnitOfTemperature.FAHRENHEIT, UnitOfTemperature.CELSIUS
+                        )
+                        for value in (mean, peak)
+                    )
+                out[dt_util.utc_from_timestamp(row["start"])] = (float(mean), float(peak))
+            return out
+
+        flow = series(flow_id)
+        ret = series(return_id)
+        indoor = series(indoor_id)
+        hours: list[HourPoint] = []
+        for start, (flow_mean, flow_max) in sorted(flow.items()):
+            room = indoor[start][0] if start in indoor else self._indoor_fallback_c
+            if room is None:
+                continue
+            return_mean, return_max = ret.get(start, (None, None))
+            hours.append(HourPoint(start, flow_mean, flow_max, room, return_mean, return_max))
+
+        def local_day(moment: datetime) -> date:
+            return dt_util.as_local(moment).date()
+
+        self._history_days["flow"] = len({local_day(t) for t in flow})
+        if return_id:
+            self._history_days["return"] = len({local_day(t) for t in ret})
+        samples = self._training_samples
+        litres = {s.week_start: s.litres_used for s in samples if s.week_start is not None}
+        baseline = None
+        if len(samples) >= MIN_TRAINING_WEEKS:
+            try:
+                baseline = fit_usage_model(samples).oil_baseline_litres_per_day
+            except ValueError:
+                baseline = None
+        self.boiler = await self.hass.async_add_executor_job(
+            partial(
+                analyse_boiler,
+                hours,
+                local_day,
+                litres,
+                self._outdoor_history,
+                baseline,
+                self._runtime_daily or None,
+            )
+        )
+        weekly = {
+            date.fromisoformat(day): value
+            for day, value in self.boiler.pop("weekly_hours", {}).items()
+        }
+        self.boiler["flow_entity"] = flow_id
+        self.boiler["return_entity"] = return_id
+        self.boiler["analysed_at"] = now.isoformat()
+        if self.boiler.get("status") != "ok":
+            return
+        if self.entry.data.get(CONF_RUNTIME_ENTITY):
+            self.boiler_hours = {"status": "runtime_sensor"}
+            return
+
+        # Without a runtime sensor, try flow-based heating hours in the model,
+        # keeping them only if they would have predicted past weeks better.
+        with_hours = [
+            replace(s, heating_hours=weekly[s.week_start])
+            for s in samples
+            if s.week_start in weekly
+        ]
+        self.boiler_hours = {"status": "off_no_data", "weeks": len(with_hours)}
+        if len(with_hours) < max(MIN_TRAINING_WEEKS + 1, 0.8 * len(samples)):
+            return
+        without_hours = [replace(s, heating_hours=None) for s in with_hours]
+        base = await self.hass.async_add_executor_job(backtest_weekly, without_hours)
+        scored = await self.hass.async_add_executor_job(backtest_weekly, with_hours)
+        if base is None or scored is None or base.rmse_litres <= 0:
+            return
+        gain = 1 - scored.rmse_litres / base.rmse_litres
+        self.boiler_hours = {
+            "status": "on" if gain >= MIN_WEATHER_GAIN else "off_no_gain",
+            "weeks": len(with_hours),
+            "gain_percent": round(gain * 100, 1),
+            "rmse_without": round(base.rmse_litres, 1),
+            "rmse_with": round(scored.rmse_litres, 1),
+        }
+        if gain >= MIN_WEATHER_GAIN:
+            self._training_samples = with_hours
 
     def _level_projection(self, litres: float | None) -> list[dict[str, Any]] | None:
         """Projected litres every few days for about six months, for charting."""
@@ -838,6 +1007,8 @@ class OilPredictCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 **(asdict(self.weather_terms) if self.weather_terms else {}),
             },
             "setup_check": self.setup_check(),
+            "boiler_status": self.boiler.get("status"),
+            "boiler_hours": dict(self.boiler_hours),
             "forecast_warning": self._forecast_warning,
             "temperature_offset_c": self.temperature_offset_c,
             "indoor_target_source": self._target_source,
@@ -896,6 +1067,9 @@ class OilPredictCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._history_days = {
             role: sum(1 for values in daily.values() if role in values)
             for role in role_to_entity
+        }
+        self._runtime_daily = {
+            day: values["runtime"] for day, values in daily.items() if "runtime" in values
         }
         self._history_entities = role_to_entity
         self._update_coverage(daily, role_to_entity)
@@ -1155,6 +1329,16 @@ class OilPredictCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 "Tank temperature with daily history (optional)",
                 "Used to correct ultrasonic readings for cold air.",
                 "Without it the outdoor temperature is used; no action is needed.",
+            ),
+            "flow": (
+                "Boiler flow temperature with hourly history (optional)",
+                "Powers the Boiler tab and can stand in for a runtime sensor.",
+                statistics_fix,
+            ),
+            "return": (
+                "Boiler return temperature with hourly history (optional)",
+                "Adds the flow–return difference and condensing analysis.",
+                statistics_fix,
             ),
             "timestamp": (
                 "Tank measurement time (optional)",

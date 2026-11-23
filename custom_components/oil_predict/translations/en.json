@@ -44,7 +44,9 @@
           "stale_after_minutes": "Warn when the tank reading is older than (minutes)",
           "tank_temp_entity": "Tank temperature sensor (optional)",
           "weather_history": "Use long-term weather history for winter scenarios",
-          "history_location": "Town or postcode for weather history (optional)"
+          "history_location": "Town or postcode for weather history (optional)",
+          "flow_entity": "Boiler flow temperature sensor (optional)",
+          "return_entity": "Boiler return temperature sensor (optional)"
         },
         "data_description": {
           "outdoor_entity": "A sensor reporting the outdoor temperature in °C or °F. It must keep long-term statistics: check it is listed under Developer tools → Statistics. If it isn't, it needs a state class of \"measurement\".",
@@ -56,7 +58,9 @@
           "stale_after_minutes": "Set this a little longer than your sensor's normal reporting interval.",
           "tank_temp_entity": "Air temperature at the tank sensor. Ultrasonic sensors read slightly long in cold air; Oil Monitor checks your history for this and corrects it if needed. Leave empty to use the outdoor temperature.",
           "weather_history": "Downloads about 25 years of daily temperatures for your area from Open-Meteo (free, no account) to project mild, typical and cold winters. Only an approximate location, rounded to about 10 km, is sent. Turn off to keep everything local.",
-          "history_location": "A town, or the first part of your postcode (e.g. YO10). Leave empty to use Home Assistant's home location. Either way it is rounded to about 10 km."
+          "history_location": "A town, or the first part of your postcode (e.g. YO10). Leave empty to use Home Assistant's home location. Either way it is rounded to about 10 km.",
+          "flow_entity": "Water temperature on the pipe leaving the boiler. Used on the Boiler tab to work out how many hours the heating runs, how efficiently oil turns into heat and how fast the house loses heat; it can also stand in for a runtime sensor in the estimates. It needs long-term statistics (state class \"measurement\").",
+          "return_entity": "Water temperature on the pipe coming back to the boiler. Adds the flow–return difference, how much of the time a condensing boiler can condense, and what a cooler return would save. Needs the flow sensor too."
         }
       },
       "check": {
@@ -118,7 +122,9 @@
           "stale_after_minutes": "Warn when the tank reading is older than (minutes)",
           "tank_temp_entity": "Tank temperature sensor (optional)",
           "weather_history": "Use long-term weather history for winter scenarios",
-          "history_location": "Town or postcode for weather history (optional)"
+          "history_location": "Town or postcode for weather history (optional)",
+          "flow_entity": "Boiler flow temperature sensor (optional)",
+          "return_entity": "Boiler return temperature sensor (optional)"
         },
         "data_description": {
           "outdoor_entity": "A sensor reporting the outdoor temperature in °C or °F. It must keep long-term statistics: check it is listed under Developer tools → Statistics. If it isn't, it needs a state class of \"measurement\".",
@@ -130,7 +136,9 @@
           "stale_after_minutes": "Set this a little longer than your sensor's normal reporting interval.",
           "tank_temp_entity": "Air temperature at the tank sensor. Ultrasonic sensors read slightly long in cold air; Oil Monitor checks your history for this and corrects it if needed. Leave empty to use the outdoor temperature.",
           "weather_history": "Downloads about 25 years of daily temperatures for your area from Open-Meteo (free, no account) to project mild, typical and cold winters. Only an approximate location, rounded to about 10 km, is sent. Turn off to keep everything local.",
-          "history_location": "A town, or the first part of your postcode (e.g. YO10). Leave empty to use Home Assistant's home location. Either way it is rounded to about 10 km."
+          "history_location": "A town, or the first part of your postcode (e.g. YO10). Leave empty to use Home Assistant's home location. Either way it is rounded to about 10 km.",
+          "flow_entity": "Water temperature on the pipe leaving the boiler. Used on the Boiler tab to work out how many hours the heating runs, how efficiently oil turns into heat and how fast the house loses heat; it can also stand in for a runtime sensor in the estimates. It needs long-term statistics (state class \"measurement\").",
+          "return_entity": "Water temperature on the pipe coming back to the boiler. Adds the flow–return difference, how much of the time a condensing boiler can condense, and what a cooler return would save. Needs the flow sensor too."
         }
       },
       "check": {

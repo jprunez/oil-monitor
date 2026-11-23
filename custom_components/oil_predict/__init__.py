@@ -19,11 +19,13 @@ from .const import (
     CONF_CALIBRATION,
     CONF_DEPTH_ENTITY,
     CONF_EMPTY_DISTANCE,
+    CONF_FLOW_ENTITY,
     CONF_FULL_DISTANCE,
     CONF_INDOOR_ENTITY,
     CONF_INDOOR_TARGET_ENTITY,
     CONF_LEVEL_TYPE,
     CONF_OUTDOOR_ENTITY,
+    CONF_RETURN_ENTITY,
     CONF_RUNTIME_ENTITY,
     CONF_TANK_SHAPE,
     CONF_TIMESTAMP_ENTITY,
@@ -53,6 +55,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
         [StaticPathConfig(PANEL_MODULE_URL, str(PANEL_FILE), cache_headers=False)]
     )
     websocket_api.async_register_command(hass, websocket_data_check)
+    websocket_api.async_register_command(hass, websocket_boiler)
     return True
 
 
@@ -66,6 +69,25 @@ def websocket_data_check(
         coordinator = getattr(entry, "runtime_data", None)
         if isinstance(coordinator, OilPredictCoordinator):
             connection.send_result(msg["id"], coordinator.data_check())
+            return
+    connection.send_error(
+        msg["id"], "not_loaded", "Oil Monitor is not set up or has not finished loading."
+    )
+
+
+@websocket_api.websocket_command({vol.Required("type"): f"{DOMAIN}/boiler"})
+@callback
+def websocket_boiler(
+    hass: HomeAssistant, connection: websocket_api.ActiveConnection, msg: dict
+) -> None:
+    """Return the boiler analysis behind the dashboard's Boiler tab."""
+    for entry in hass.config_entries.async_entries(DOMAIN):
+        coordinator = getattr(entry, "runtime_data", None)
+        if isinstance(coordinator, OilPredictCoordinator):
+            connection.send_result(
+                msg["id"],
+                {**coordinator.boiler, "forecast_use": dict(coordinator.boiler_hours)},
+            )
             return
     connection.send_error(
         msg["id"], "not_loaded", "Oil Monitor is not set up or has not finished loading."
@@ -137,6 +159,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             "outdoor_entity": config[CONF_OUTDOOR_ENTITY],
             "indoor_entity": config[CONF_INDOOR_ENTITY],
             "runtime_entity": config.get(CONF_RUNTIME_ENTITY),
+            "flow_entity": config.get(CONF_FLOW_ENTITY),
+            "return_entity": config.get(CONF_RETURN_ENTITY),
+            "efficiency_entity": entity_id(Platform.SENSOR, "heating_efficiency"),
             "target_entity": config[CONF_INDOOR_TARGET_ENTITY],
             "weather_entity": config[CONF_WEATHER_ENTITY],
             "tank_capacity": tank.capacity_litres,

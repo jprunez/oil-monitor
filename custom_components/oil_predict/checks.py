@@ -16,9 +16,11 @@ from homeassistant.util.unit_conversion import TemperatureConverter
 
 from .const import (
     CONF_DEPTH_ENTITY,
+    CONF_FLOW_ENTITY,
     CONF_INDOOR_ENTITY,
     CONF_INDOOR_TARGET_ENTITY,
     CONF_OUTDOOR_ENTITY,
+    CONF_RETURN_ENTITY,
     CONF_RUNTIME_ENTITY,
     CONF_TANK_TEMP_ENTITY,
     CONF_TIMESTAMP_ENTITY,
@@ -27,7 +29,8 @@ from .const import (
 from .model import LEVEL_DISTANCE, LEVEL_LITRES, LEVEL_PERCENT, parse_sample_timestamp
 
 # Roles whose daily long-term statistics are read.
-STATISTIC_ROLES = ("level", "outdoor", "indoor", "runtime", "tank_temp")
+STATISTIC_ROLES = ("level", "outdoor", "indoor", "runtime", "tank_temp", "flow", "return")
+TEMPERATURE_ROLES = ("outdoor", "indoor", "tank_temp", "flow", "return")
 
 LEVEL_UNITS = {
     LEVEL_DISTANCE: ("cm",),
@@ -52,6 +55,10 @@ def entity_roles(config: Mapping[str, Any]) -> list[tuple[str, str, str]]:
     ]
     if config.get(CONF_RUNTIME_ENTITY):
         items.append(("runtime", "Heating runtime", config[CONF_RUNTIME_ENTITY]))
+    if config.get(CONF_FLOW_ENTITY):
+        items.append(("flow", "Boiler flow temperature", config[CONF_FLOW_ENTITY]))
+    if config.get(CONF_RETURN_ENTITY):
+        items.append(("return", "Boiler return temperature", config[CONF_RETURN_ENTITY]))
     if config.get(CONF_TANK_TEMP_ENTITY):
         items.append(("tank_temp", "Tank temperature", config[CONF_TANK_TEMP_ENTITY]))
     if config.get(CONF_TIMESTAMP_ENTITY):
@@ -128,7 +135,7 @@ def check_entity(
                 f"Its unit is {unit}, but Oil Monitor is set up for "
                 f"{LEVEL_NAMES[level_type]}. Check the sensor type under Configure."
             )
-        if role in ("outdoor", "indoor", "tank_temp") and unit not in (
+        if role in TEMPERATURE_ROLES and unit not in (
             UnitOfTemperature.CELSIUS,
             UnitOfTemperature.FAHRENHEIT,
         ):
@@ -159,6 +166,10 @@ def check_entity(
                     notes.append(
                         f"{reason} The outdoor temperature is used for the "
                         "tank reading correction instead."
+                    )
+                elif role in ("flow", "return"):
+                    notes.append(
+                        f"{reason} The Boiler tab needs its hourly history."
                     )
                 elif role == "outdoor":
                     notes.append(f"{reason} Charts and estimates need it.")

@@ -19,6 +19,8 @@ from homeassistant.loader import async_get_integration
 
 from .const import (
     CONF_DEPTH_ENTITY,
+    CONF_FLOW_ENTITY,
+    CONF_RETURN_ENTITY,
     CONF_INDOOR_ENTITY,
     CONF_INDOOR_TARGET_ENTITY,
     CONF_OUTDOOR_ENTITY,
@@ -33,6 +35,8 @@ from .model import MIN_TRAINING_WEEKS
 
 SOURCE_KEYS = (
     CONF_DEPTH_ENTITY,
+    CONF_FLOW_ENTITY,
+    CONF_RETURN_ENTITY,
     CONF_TIMESTAMP_ENTITY,
     CONF_OUTDOOR_ENTITY,
     CONF_INDOOR_ENTITY,
@@ -107,6 +111,8 @@ async def async_get_config_entry_diagnostics(
         "scenarios": data.get("scenario_info"),
         "backtest": data.get("backtest"),
         "weather_terms": data.get("weather_terms"),
+        "boiler": {k: v for k, v in coordinator.boiler.items() if k not in ("weeks", "days")},
+        "boiler_hours": coordinator.boiler_hours,
         "sources": {
             key: _source(hass, entry.data.get(key)) for key in SOURCE_KEYS
         },

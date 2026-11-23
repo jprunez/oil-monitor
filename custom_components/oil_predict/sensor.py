@@ -8,6 +8,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
+from .const import CONF_FLOW_ENTITY
 from .coordinator import OilPredictCoordinator
 
 
@@ -18,8 +19,12 @@ async def async_setup_entry(
 ) -> None:
     """Set up oil sensors from a config entry."""
     coordinator: OilPredictCoordinator = entry.runtime_data
+    extra: list[SensorEntity] = []
+    if entry.data.get(CONF_FLOW_ENTITY):
+        extra.append(HeatingEfficiencySensor(coordinator, entry))
     async_add_entities(
         [
+            *extra,
             OilLitresRemainingSensor(coordinator, entry),
             WeeklyOilUsageSensor(coordinator, entry, "total"),
             WeeklyOilUsageSensor(coordinator, entry, "lower"),
@@ -185,3 +190,57 @@ class OilRunOutSensor(CoordinatorEntity[OilPredictCoordinator], SensorEntity):
         if self._level == "empty":
             attributes["projection"] = self.coordinator.data["level_projection"]
         return attributes
+
+
+class HeatingEfficiencySensor(CoordinatorEntity[OilPredictCoordinator], SensorEntity):
+    """Relative boiler efficiency: heat delivered per litre, 100 % = usual.
+
+    Falls when the boiler needs a service (soot, a worn nozzle) and rises
+    after one. Worked out from the flow (and return) temperatures.
+    """
+
+    _attr_has_entity_name = True
+    _attr_name = "Heating efficiency"
+    _attr_native_unit_of_measurement = "%"
+    _attr_state_class = "measurement"
+    _attr_suggested_display_precision = 0
+    _attr_icon = "mdi:fire-circle"
+
+    def __init__(self, coordinator: OilPredictCoordinator, entry: ConfigEntry) -> None:
+        """Initialize the sensor."""
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{entry.entry_id}_heating_efficiency"
+        self._attr_device_info = coordinator.device_info
+
+    @property
+    def _trend(self) -> dict[str, Any] | None:
+        return self.coordinator.boiler.get("efficiency")
+
+    @property
+    def available(self) -> bool:
+        """Only report once there are enough heating weeks to compare."""
+        return super().available and self._trend is not None
+
+    @property
+    def native_value(self) -> float | None:
+        """Average of the last four weeks, relative to this house's usual."""
+        trend = self._trend
+        return trend["latest_percent"] if trend else None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Trend, service flag and burner figures."""
+        boiler = self.coordinator.boiler
+        trend = self._trend or {}
+        burn = boiler.get("burn") or {}
+        summary = boiler.get("summary") or {}
+        return {
+            "change_per_year_percent": trend.get("change_per_year_percent"),
+            "weeks": trend.get("weeks"),
+            "service_suggested": boiler.get("efficiency_alert", False),
+            "litres_per_heating_hour": burn.get("litres_per_hour"),
+            "heating_hours_per_day": summary.get("hours_per_day"),
+            "flow_temperature_c": summary.get("flow_c"),
+            "return_temperature_c": summary.get("return_c"),
+            "condensing_share": summary.get("condensing_share"),
+        }
