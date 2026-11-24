@@ -21,6 +21,7 @@ CONF_RUNTIME_ENTITY = "runtime_entity"  # optional
 CONF_TANK_TEMP_ENTITY = "tank_temp_entity"  # optional
 CONF_FLOW_ENTITY = "flow_entity"  # optional boiler flow temperature
 CONF_RETURN_ENTITY = "return_entity"  # optional boiler return temperature
+CONF_ROOM_ENTITIES = "room_entities"  # optional list of room temperature sensors
 CONF_INDOOR_TARGET_ENTITY = "indoor_target_entity"
 CONF_WEATHER_ENTITY = "weather_entity"
 CONF_STALE_AFTER_MINUTES = "stale_after_minutes"

@@ -36,6 +36,7 @@ from .const import (
     CONF_LEVEL_TYPE,
     CONF_OUTDOOR_ENTITY,
     CONF_RETURN_ENTITY,
+    CONF_ROOM_ENTITIES,
     CONF_RUNTIME_ENTITY,
     CONF_STALE_AFTER_MINUTES,
     CONF_TANK_CAPACITY,
@@ -70,6 +71,7 @@ OPTIONAL_ENTITIES = (
     CONF_RUNTIME_ENTITY,
     CONF_FLOW_ENTITY,
     CONF_RETURN_ENTITY,
+    CONF_ROOM_ENTITIES,
     CONF_TIMESTAMP_ENTITY,
     CONF_TANK_TEMP_ENTITY,
     CONF_HISTORY_LOCATION,
@@ -134,6 +136,11 @@ SENSORS_SCHEMA = vol.Schema(
         vol.Optional(CONF_RUNTIME_ENTITY): _sensor(),
         vol.Optional(CONF_FLOW_ENTITY): _sensor(),
         vol.Optional(CONF_RETURN_ENTITY): _sensor(),
+        vol.Optional(CONF_ROOM_ENTITIES): selector.EntitySelector(
+            selector.EntitySelectorConfig(
+                domain="sensor", device_class="temperature", multiple=True
+            )
+        ),
         vol.Optional(CONF_TIMESTAMP_ENTITY): _sensor(),
         vol.Optional(CONF_TANK_TEMP_ENTITY): _sensor(),
         vol.Required(CONF_WEATHER_HISTORY, default=True): selector.BooleanSelector(),

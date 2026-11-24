@@ -46,7 +46,8 @@
           "weather_history": "Use long-term weather history for winter scenarios",
           "history_location": "Town or postcode for weather history (optional)",
           "flow_entity": "Boiler flow temperature sensor (optional)",
-          "return_entity": "Boiler return temperature sensor (optional)"
+          "return_entity": "Boiler return temperature sensor (optional)",
+          "room_entities": "Room temperature sensors (optional)"
         },
         "data_description": {
           "outdoor_entity": "A sensor reporting the outdoor temperature in °C or °F. It must keep long-term statistics: check it is listed under Developer tools → Statistics. If it isn't, it needs a state class of \"measurement\".",
@@ -60,7 +61,8 @@
           "weather_history": "Downloads about 25 years of daily temperatures for your area from Open-Meteo (free, no account) to project mild, typical and cold winters. Only an approximate location, rounded to about 10 km, is sent. Turn off to keep everything local.",
           "history_location": "A town, or the first part of your postcode (e.g. YO10). Leave empty to use Home Assistant's home location. Either way it is rounded to about 10 km.",
           "flow_entity": "Water temperature on the pipe leaving the boiler. Used on the Boiler tab to work out how many hours the heating runs, how efficiently oil turns into heat and how fast the house loses heat; it can also stand in for a runtime sensor in the estimates. It needs long-term statistics (state class \"measurement\").",
-          "return_entity": "Water temperature on the pipe coming back to the boiler. Adds the flow–return difference, how much of the time a condensing boiler can condense, and what a cooler return would save. Needs the flow sensor too."
+          "return_entity": "Water temperature on the pipe coming back to the boiler. Adds the flow–return difference, how much of the time a condensing boiler can condense, and what a cooler return would save. Needs the flow sensor too.",
+          "room_entities": "One temperature sensor per room. The Boiler tab compares rooms to find where heat escapes, which radiators are slow and which rooms run too warm or cold. Works from Home Assistant's recent history, so advice appears after a night or two."
         }
       },
       "check": {
@@ -124,7 +126,8 @@
           "weather_history": "Use long-term weather history for winter scenarios",
           "history_location": "Town or postcode for weather history (optional)",
           "flow_entity": "Boiler flow temperature sensor (optional)",
-          "return_entity": "Boiler return temperature sensor (optional)"
+          "return_entity": "Boiler return temperature sensor (optional)",
+          "room_entities": "Room temperature sensors (optional)"
         },
         "data_description": {
           "outdoor_entity": "A sensor reporting the outdoor temperature in °C or °F. It must keep long-term statistics: check it is listed under Developer tools → Statistics. If it isn't, it needs a state class of \"measurement\".",
@@ -138,7 +141,8 @@
           "weather_history": "Downloads about 25 years of daily temperatures for your area from Open-Meteo (free, no account) to project mild, typical and cold winters. Only an approximate location, rounded to about 10 km, is sent. Turn off to keep everything local.",
           "history_location": "A town, or the first part of your postcode (e.g. YO10). Leave empty to use Home Assistant's home location. Either way it is rounded to about 10 km.",
           "flow_entity": "Water temperature on the pipe leaving the boiler. Used on the Boiler tab to work out how many hours the heating runs, how efficiently oil turns into heat and how fast the house loses heat; it can also stand in for a runtime sensor in the estimates. It needs long-term statistics (state class \"measurement\").",
-          "return_entity": "Water temperature on the pipe coming back to the boiler. Adds the flow–return difference, how much of the time a condensing boiler can condense, and what a cooler return would save. Needs the flow sensor too."
+          "return_entity": "Water temperature on the pipe coming back to the boiler. Adds the flow–return difference, how much of the time a condensing boiler can condense, and what a cooler return would save. Needs the flow sensor too.",
+          "room_entities": "One temperature sensor per room. The Boiler tab compares rooms to find where heat escapes, which radiators are slow and which rooms run too warm or cold. Works from Home Assistant's recent history, so advice appears after a night or two."
         }
       },
       "check": {

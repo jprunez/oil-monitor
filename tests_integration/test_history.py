@@ -621,3 +621,51 @@ async def test_boiler_flow_sensor_analysis(hass: HomeAssistant) -> None:
     state = hass.states.get(efficiency_id)
     assert float(state.state) == pytest.approx(100, abs=10)
     assert state.attributes["litres_per_heating_hour"] > 0
+
+
+async def test_room_analysis(hass: HomeAssistant) -> None:
+    """Room sensors are read from state history and analysed on request."""
+    await _record_history(hass, runtime_as_total=False)
+    hass.states.async_set("sensor.tank_depth", "68", {"unit_of_measurement": "cm"})
+    hass.states.async_set("sensor.outdoor", "6", {"unit_of_measurement": "°C"})
+    hass.states.async_set("sensor.indoor", "19.5", {"unit_of_measurement": "°C"})
+    hass.states.async_set("climate.home", "heat", {"temperature": 19})
+    for entity_id, name, value in (
+        ("sensor.lounge_temperature", "Lounge Temperature", "20.5"),
+        ("sensor.study_temperature", "Study Temperature", "64.4"),
+    ):
+        unit = "°F" if entity_id.startswith("sensor.study") else "°C"
+        hass.states.async_set(
+            entity_id, value, {"unit_of_measurement": unit, "friendly_name": name}
+        )
+    await async_wait_recording_done(hass)
+
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        version=2,
+        unique_id=DOMAIN,
+        data={
+            "depth_entity": "sensor.tank_depth",
+            "level_type": "distance",
+            "tank_capacity": 1000,
+            "tank_shape": "vertical",
+            "full_distance_cm": 10,
+            "empty_distance_cm": 120,
+            "outdoor_entity": "sensor.outdoor",
+            "indoor_entity": "sensor.indoor",
+            "indoor_target_entity": "climate.home",
+            "weather_entity": "weather.home",
+            "room_entities": ["sensor.lounge_temperature", "sensor.study_temperature"],
+            "stale_after_minutes": 90,
+        },
+    )
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    result = await entry.runtime_data.async_rooms()
+    assert result["status"] == "ok", result
+    rooms = {room["name"]: room for room in result["rooms"]}
+    assert set(rooms) == {"Lounge", "Study"}
+    assert rooms["Study"]["mean_c"] == pytest.approx(18, abs=0.1)
+    assert not result["has_flow"]

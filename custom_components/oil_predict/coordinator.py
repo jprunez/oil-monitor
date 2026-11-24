@@ -8,7 +8,10 @@ from functools import partial
 import logging
 from typing import Any
 
-from homeassistant.components.recorder.history import state_changes_during_period
+from homeassistant.components.recorder.history import (
+    get_significant_states,
+    state_changes_during_period,
+)
 from homeassistant.components.recorder.statistics import statistics_during_period
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import UnitOfTemperature
@@ -36,6 +39,7 @@ from .const import (
     CONF_LEVEL_TYPE,
     CONF_OUTDOOR_ENTITY,
     CONF_RETURN_ENTITY,
+    CONF_ROOM_ENTITIES,
     CONF_RUNTIME_ENTITY,
     CONF_STALE_AFTER_MINUTES,
     CONF_TANK_CAPACITY,
@@ -57,6 +61,7 @@ from .checks import (
 )
 from .climate_history import ClimateHistoryManager
 from .heating import HourPoint, analyse_boiler
+from .rooms import analyse_rooms
 from .model import (
     DEPTH_TO_PERCENT,
     FALLBACK_SCENARIO_SHIFT_C,
@@ -183,6 +188,8 @@ class OilPredictCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # Boiler analysis from flow/return temperatures (the Boiler tab).
         self.boiler: dict[str, Any] = {"status": "no_sensor"}
         self.boiler_hours: dict[str, Any] = {"status": "off"}
+        self._rooms: dict[str, Any] | None = None
+        self._rooms_at: datetime | None = None
         self._runtime_daily: dict[date, float] = {}
         self.tank = tank_from_config(entry.data)
         self.reorder_level_litres = round(self.tank.capacity_litres * REORDER_FRACTION)
@@ -657,6 +664,71 @@ class OilPredictCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 f"are enough clean weeks ({MIN_TRAINING_WEEKS + 1})."
             )
         return f"On. {use} See the Boiler tab."
+
+    async def async_rooms(self) -> dict[str, Any]:
+        """Room-by-room analysis from recent state history, cached 15 minutes."""
+        room_ids = list(self.entry.data.get(CONF_ROOM_ENTITIES) or [])
+        if not room_ids:
+            return {"status": "no_rooms"}
+        now = dt_util.utcnow()
+        if self._rooms is not None and self._rooms_at and now - self._rooms_at < timedelta(minutes=15):
+            return self._rooms
+        start = now - timedelta(days=10)
+        outdoor_id = self.entry.data[CONF_OUTDOOR_ENTITY]
+        flow_id = self.entry.data.get(CONF_FLOW_ENTITY)
+        ids = [*room_ids, outdoor_id, *([flow_id] if flow_id else [])]
+        try:
+            states = await get_instance(self.hass).async_add_executor_job(
+                partial(
+                    get_significant_states,
+                    self.hass,
+                    start,
+                    now,
+                    ids,
+                    None,
+                    True,  # include_start_time_state
+                    False,  # significant_changes_only
+                    False,  # minimal_response
+                    True,  # no_attributes
+                )
+            )
+        except HomeAssistantError as err:
+            return {"status": "error", "message": f"Could not read history: {err}"}
+
+        def series(entity_id: str) -> list[tuple[datetime, float]]:
+            fahrenheit = self._entity_unit(entity_id) == UnitOfTemperature.FAHRENHEIT
+            out = []
+            for state in states.get(entity_id, states.get(entity_id.lower(), [])):
+                try:
+                    value = float(state.state)
+                except (TypeError, ValueError):
+                    continue
+                if fahrenheit:
+                    value = TemperatureConverter.convert(
+                        value, UnitOfTemperature.FAHRENHEIT, UnitOfTemperature.CELSIUS
+                    )
+                out.append((max(state.last_changed, start), value))
+            return out
+
+        def name(entity_id: str) -> str:
+            state = self.hass.states.get(entity_id)
+            label = (state.name if state else None) or entity_id
+            for suffix in (" Temperature", " temperature", " Temp", " temp"):
+                if label.endswith(suffix) and len(label) > len(suffix):
+                    label = label[: -len(suffix)]
+            return label
+
+        rooms = {entity_id: (name(entity_id), series(entity_id)) for entity_id in room_ids}
+        result = await self.hass.async_add_executor_job(
+            analyse_rooms,
+            rooms,
+            series(outdoor_id),
+            series(flow_id) if flow_id else None,
+            start,
+            now,
+        )
+        self._rooms, self._rooms_at = result, now
+        return result
 
     async def _async_update_boiler(self) -> None:
         """Analyse hourly flow/return history and, if it helps, use it to forecast."""
